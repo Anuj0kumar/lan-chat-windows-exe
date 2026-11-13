@@ -1453,6 +1453,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <div class="header-actions">
+          <button type="button" class="icon-btn" id="group-invite-btn" title="Invite others to this group">Invite</button>
           <button type="button" class="icon-btn" id="voice-call-btn" style="display:none;">Call</button>
           <button type="button" class="icon-btn" id="video-call-btn" style="display:none;">Video</button>
           <button type="button" class="icon-btn" id="clear-chat-btn">Clear Chat</button>
@@ -1496,7 +1497,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
   <div id="invite-modal">
     <div class="invite-card">
-      <div class="chat-title">Invite via Hotspot / Wi-Fi</div>
+      <div class="chat-title" id="invite-modal-title">Invite via Hotspot / Wi-Fi</div>
       <div class="chat-status">Turn off mobile data, connect to the same hotspot/Wi-Fi, and scan:</div>
       <div class="invite-qr-box"><img id="invite-qr-img" alt="Join QR Code" /></div>
       <div class="invite-url" id="invite-url-text">Loading...</div>
@@ -1837,6 +1838,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         ? "Delete Group"
         : "Clear Chat";
       const showCallBtns = !room.isGroup && Boolean(room.peer);
+      document.getElementById("group-invite-btn").style.display = room.isGroup ? "inline-flex" : "none";
       document.getElementById("voice-call-btn").style.display = showCallBtns ? "inline-flex" : "none";
       document.getElementById("video-call-btn").style.display = showCallBtns ? "inline-flex" : "none";
       renderSidebar();
@@ -2218,7 +2220,25 @@ OFFLINE_HTML = """<!DOCTYPE html>
       }
       await ensureE2EEKeys();
       await loadRooms();
-      await selectRoom(activeRoom, false);
+      const joinId = new URLSearchParams(location.search).get("join");
+      if (joinId) {
+        const targetRoom = rooms.find(r => r.id === joinId);
+        if (targetRoom) {
+          activeRoom = {
+            id: targetRoom.id,
+            name: targetRoom.name,
+            isGroup: true,
+            createdBy: targetRoom.created_by || "",
+            peer: null,
+          };
+          history.replaceState(null, "", "/");
+          await selectRoom(activeRoom, true);
+        } else {
+          await selectRoom(activeRoom, false);
+        }
+      } else {
+        await selectRoom(activeRoom, false);
+      }
       connectWS();
     }
 
@@ -2259,18 +2279,25 @@ OFFLINE_HTML = """<!DOCTYPE html>
     const inviteUrlText = document.getElementById("invite-url-text");
     const inviteQrImg = document.getElementById("invite-qr-img");
 
-    document.getElementById("invite-btn").onclick = async () => {
+    async function openInviteModal(title, joinRoomId = "") {
+      document.getElementById("invite-modal-title").textContent = title;
+      let baseUrl = location.origin;
       try {
         const res = await fetch("/api/network-info");
         const info = await res.json();
-        const url = info.primary_url || location.origin;
-        inviteUrlText.textContent = url;
-        inviteQrImg.src = `/api/qr.svg?url=${encodeURIComponent(url)}`;
-      } catch {
-        inviteUrlText.textContent = location.origin;
-        inviteQrImg.src = `/api/qr.svg?url=${encodeURIComponent(location.origin)}`;
-      }
+        if (info.primary_url) baseUrl = info.primary_url;
+      } catch {}
+      const url = joinRoomId ? `${baseUrl}/?join=${encodeURIComponent(joinRoomId)}` : baseUrl;
+      inviteUrlText.textContent = url;
+      inviteQrImg.src = `/api/qr.svg?url=${encodeURIComponent(url)}`;
       inviteModal.classList.add("active");
+    }
+
+    document.getElementById("invite-btn").onclick = () => openInviteModal("Invite via Hotspot / Wi-Fi");
+    document.getElementById("group-invite-btn").onclick = () => {
+      if (activeRoom && activeRoom.isGroup) {
+        openInviteModal(`Invite to # ${activeRoom.name}`, activeRoom.id);
+      }
     };
     document.getElementById("close-invite-btn").onclick = () => inviteModal.classList.remove("active");
     document.getElementById("copy-invite-btn").onclick = async () => {
