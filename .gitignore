@@ -1,0 +1,10 @@
+__pycache__/
+build/
+dist/
+*.spec
+*.db
+*.db-wal
+*.db-shm
+lan_uploads/
+cert.pem
+key.pem
