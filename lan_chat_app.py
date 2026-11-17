@@ -25,6 +25,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
@@ -61,6 +62,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="LAN Chat App", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 def utc_now_iso() -> str:
@@ -79,7 +81,12 @@ def parse_utc(ts: str | None) -> datetime | None:
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
+
+
+async def run_db(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def get_client_ip(conn_obj: Request | WebSocket) -> str:
@@ -103,6 +110,8 @@ def init_db() -> None:
     with get_db() as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-8000;")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -200,6 +209,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN reply_sender TEXT")
         if "reply_preview" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN reply_preview TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_sender_status ON messages(room_id, sender, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(message_id)")
 
         conn.execute(
             "INSERT OR IGNORE INTO rooms (id, name, is_group, created_at) VALUES (?, ?, 1, ?)",
@@ -320,24 +333,38 @@ class ConnectionManager:
                 )
                 conn.commit()
 
-    async def send_to_user(self, username: str, payload: dict[str, Any]) -> None:
-        sockets = list(self.active.get(username, set()))
-        dead: list[WebSocket] = []
-        for ws in sockets:
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
+    async def _send_one(self, username: str, ws: WebSocket, payload: dict[str, Any]) -> None:
+        try:
+            await asyncio.wait_for(ws.send_json(payload), timeout=2.0)
+        except Exception:
             self.disconnect(username, ws)
 
+    async def send_to_user(self, username: str, payload: dict[str, Any]) -> None:
+        sockets = list(self.active.get(username, set()))
+        if not sockets:
+            return
+        await asyncio.gather(
+            *(self._send_one(username, ws, payload) for ws in sockets),
+            return_exceptions=True,
+        )
+
     async def broadcast_all(self, payload: dict[str, Any]) -> None:
-        for username in list(self.active.keys()):
-            await self.send_to_user(username, payload)
+        tasks = [
+            self._send_one(username, ws, payload)
+            for username, sockets in list(self.active.items())
+            for ws in list(sockets)
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def broadcast_presence(self) -> None:
-        with get_db() as conn:
-            rows = conn.execute("SELECT username, public_key, last_seen FROM users ORDER BY username").fetchall()
+        def _fetch_users() -> list[sqlite3.Row]:
+            with get_db() as conn:
+                return conn.execute(
+                    "SELECT username, public_key, last_seen FROM users ORDER BY username"
+                ).fetchall()
+
+        rows = await run_db(_fetch_users)
         users = [
             {
                 "username": row["username"],
@@ -421,7 +448,8 @@ async def pwa_icon() -> Response:
 
 @app.get("/sw.js")
 async def pwa_service_worker() -> Response:
-    sw_js = '''const CACHE_NAME = "lan-chat-shell-v2";
+    sw_js = '''const CACHE_NAME = "lan-chat-shell-v6";
+const MEDIA_CACHE = "lan-chat-media-v1";
 const SHELL_URLS = ["/", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
@@ -432,7 +460,7 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      Promise.all(keys.filter((k) => k !== CACHE_NAME && k !== MEDIA_CACHE).map((k) => caches.delete(k)))
     )
   );
   self.clients.claim();
@@ -440,11 +468,30 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  if (event.request.method !== "GET" || url.pathname.startsWith("/api/") || url.pathname.startsWith("/uploads/")) {
+  if (event.request.method !== "GET" || url.pathname.startsWith("/api/")) {
+    return;
+  }
+  if (url.pathname.startsWith("/uploads/")) {
+    event.respondWith(
+      caches.open(MEDIA_CACHE).then(async (cache) => {
+        const hit = await cache.match(event.request);
+        if (hit) return hit;
+        const resp = await fetch(event.request);
+        if (resp.ok) cache.put(event.request, resp.clone());
+        return resp;
+      })
+    );
     return;
   }
   event.respondWith(
-    fetch(event.request).catch(() => caches.match(event.request))
+    caches.open(CACHE_NAME).then(async (cache) => {
+      const cached = await cache.match(event.request);
+      const netFetch = fetch(event.request).then((resp) => {
+        if (resp.ok) cache.put(event.request, resp.clone());
+        return resp;
+      }).catch(() => cached);
+      return cached || netFetch;
+    })
   );
 });
 '''
@@ -690,7 +737,9 @@ async def clear_or_delete_room(
 async def get_messages(
     room_id: str,
     request: Request,
-    limit: int = 100,
+    limit: int = 50,
+    before_id: int | None = Query(default=None),
+    after_id: int | None = Query(default=None),
     x_auth_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
     username = verify_token(x_auth_token, get_client_ip(request))
@@ -705,14 +754,21 @@ async def get_messages(
         ).fetchone()
         min_id = int(cleared["cleared_after_id"]) if cleared else 0
 
+        effective_min = max(min_id, after_id) if after_id is not None else min_id
+        upper_clause = "AND m.id < ?" if before_id is not None else ""
+        params: list[Any] = [room_id, effective_min]
+        if before_id is not None:
+            params.append(before_id)
+        params.extend([username, limit])
         rows = conn.execute(
-            """
+            f"""
             SELECT m.id, m.room_id, m.sender, m.content, m.msg_type, m.file_name, m.file_url,
                    m.status, m.read_at, m.edited_at, m.deleted_for_all,
                    m.reply_to_id, m.reply_sender, m.reply_preview, m.created_at
             FROM messages m
             WHERE m.room_id = ?
               AND m.id > ?
+              {upper_clause}
               AND NOT EXISTS (
                   SELECT 1 FROM hidden_messages h
                   WHERE h.username = ? AND h.message_id = m.id
@@ -720,7 +776,7 @@ async def get_messages(
             ORDER BY m.id DESC
             LIMIT ?
             """,
-            (room_id, min_id, username, limit),
+            params,
         ).fetchall()
         messages = [dict(r) for r in reversed(rows)]
         if messages:
@@ -793,9 +849,10 @@ async def download_file(stored_name: str, inline: bool = Query(default=False)) -
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
     orig = safe_name.split("_", 1)[-1]
+    headers = {"Cache-Control": "public, max-age=604800, immutable"}
     if inline:
-        return FileResponse(path, media_type="application/pdf" if orig.lower().endswith(".pdf") else None)
-    return FileResponse(path, filename=orig)
+        return FileResponse(path, media_type="application/pdf" if orig.lower().endswith(".pdf") else None, headers=headers)
+    return FileResponse(path, filename=orig, headers=headers)
 
 
 @app.websocket("/ws/{username}")
@@ -824,6 +881,7 @@ async def websocket_endpoint(
         return
 
     await manager.connect(clean_user, websocket)
+    last_typing_sent: dict[str, float] = {}
     try:
         while True:
             raw = await websocket.receive_text()
@@ -854,11 +912,17 @@ async def websocket_endpoint(
 
             elif event_type == "typing":
                 room_id = data.get("room_id", "group:general")
+                is_typing = bool(data.get("is_typing", False))
+                now_mono = time.monotonic()
+                if is_typing and (now_mono - last_typing_sent.get(room_id, 0.0)) < 0.8:
+                    continue
+                if is_typing:
+                    last_typing_sent[room_id] = now_mono
                 payload = {
                     "type": "typing",
                     "room_id": room_id,
                     "sender": clean_user,
-                    "is_typing": bool(data.get("is_typing", False)),
+                    "is_typing": is_typing,
                 }
                 targets = room_targets(room_id)
                 if targets is None:
@@ -876,17 +940,20 @@ async def websocket_endpoint(
                     continue
 
                 now_read = utc_now_iso()
-                with get_db() as conn:
-                    cur = conn.execute(
-                        """
-                        UPDATE messages
-                        SET status = 'read', read_at = COALESCE(read_at, ?)
-                        WHERE room_id = ? AND sender != ? AND status != 'read'
-                        """,
-                        (now_read, room_id, clean_user),
-                    )
-                    changed = cur.rowcount
-                    conn.commit()
+                def _do_mark_read() -> int:
+                    with get_db() as conn:
+                        cur = conn.execute(
+                            """
+                            UPDATE messages
+                            SET status = 'read', read_at = COALESCE(read_at, ?)
+                            WHERE room_id = ? AND sender != ? AND status != 'read'
+                            """,
+                            (now_read, room_id, clean_user),
+                        )
+                        conn.commit()
+                        return cur.rowcount
+
+                changed = await run_db(_do_mark_read)
 
                 if changed > 0:
                     receipt = {"type": "receipt", "room_id": room_id, "status": "read"}
@@ -1061,22 +1128,25 @@ async def websocket_endpoint(
                 initial_status = "delivered" if other_online else "sent"
 
                 created_at = utc_now_iso()
-                with get_db() as conn:
-                    cur = conn.execute(
-                        """
-                        INSERT INTO messages (
-                            room_id, sender, content, msg_type, file_name, file_url,
-                            status, reply_to_id, reply_sender, reply_preview, created_at
+                def _do_insert_msg() -> int:
+                    with get_db() as conn:
+                        cur = conn.execute(
+                            """
+                            INSERT INTO messages (
+                                room_id, sender, content, msg_type, file_name, file_url,
+                                status, reply_to_id, reply_sender, reply_preview, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                room_id, clean_user, content, msg_type, file_name, file_url,
+                                initial_status, reply_to_id, reply_sender, reply_preview, created_at,
+                            ),
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            room_id, clean_user, content, msg_type, file_name, file_url,
-                            initial_status, reply_to_id, reply_sender, reply_preview, created_at,
-                        ),
-                    )
-                    conn.commit()
-                    msg_id = cur.lastrowid
+                        conn.commit()
+                        return int(cur.lastrowid)
+
+                msg_id = await run_db(_do_insert_msg)
 
                 payload = {
                     "type": "message",
@@ -1147,27 +1217,151 @@ OFFLINE_HTML = """<!DOCTYPE html>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <style>
     :root {
-      --bg: #0b141a;
-      --panel: #111b21;
-      --panel-alt: #202c33;
-      --border: #222e35;
-      --accent: #00a884;
-      --accent-dark: #005c4b;
-      --text: #e9edef;
-      --muted: #8696a0;
-      --read-blue: #53bdeb;
-      --error: #f15c6d;
-      --incoming: #202c33;
-      --outgoing: #005c4b;
+      --bg: #f4f6fb;
+      --panel: #ffffff;
+      --panel-alt: #f1f3f8;
+      --border: #e5e8f0;
+      --accent: #7c3aed;
+      --accent-dark: #6d28d9;
+      --accent-soft: #ede9fe;
+      --dark-card: #262938;
+      --text: #1e293b;
+      --muted: #64748b;
+      --read-blue: #38bdf8;
+      --error: #ef4444;
+      --online: #22c55e;
+      --incoming: #eef1f7;
+      --outgoing: #7c3aed;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
     html, body { width: 100%; height: 100%; background: var(--bg); color: var(--text); overflow: hidden; overscroll-behavior-y: auto; }
     body { display: flex; }
+    button { cursor: pointer; border: none; background: none; color: inherit; }
+
+    /* Login Overlay */
+    #login-screen {
+      position: fixed; inset: 0; background: linear-gradient(135deg, #f4f6fb 0%, #ede9fe 100%);
+      display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px;
+    }
+    .login-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 20px;
+      padding: 30px; width: 100%; max-width: 390px; display: flex; flex-direction: column; gap: 12px;
+      box-shadow: 0 20px 50px rgba(124, 58, 237, 0.12);
+    }
+    .login-card h1 { font-size: 1.45rem; color: var(--accent); font-weight: 700; }
+    .login-card p { font-size: 0.9rem; color: var(--muted); line-height: 1.45; }
+    .login-card input {
+      padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border);
+      background: var(--panel-alt); color: var(--text); font-size: 0.96rem; outline: none;
+    }
+    .login-card input:focus { border-color: var(--accent); background: #fff; }
+    .login-error { color: var(--error); font-size: 0.85rem; min-height: 18px; }
+    .primary-btn {
+      background: linear-gradient(135deg, #8b5cf6, #7c3aed); color: #ffffff; font-weight: 600;
+      padding: 11px 18px; border-radius: 12px; font-size: 0.94rem;
+      box-shadow: 0 4px 12px rgba(124, 58, 237, 0.25);
+    }
+
+    /* 3-Column App Shell */
+    #app { display: none; width: 100%; height: 100%; overflow: hidden; background: var(--panel); }
+
+    /* Left Sidebar */
+    .sidebar {
+      width: 320px; background: var(--bg); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; flex-shrink: 0;
+    }
+    .sidebar-top-icons {
+      padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    }
+    .user-badge { font-weight: 700; display: flex; align-items: center; gap: 9px; font-size: 0.95rem; }
+    .avatar-circle {
+      width: 34px; height: 34px; border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+      font-weight: 700; font-size: 0.9rem; display: inline-flex; align-items: center; justify-content: center;
+      position: relative; flex-shrink: 0; text-transform: uppercase;
+    }
+    .avatar-circle .status-dot {
+      position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; border-radius: 50%;
+      background: var(--online); border: 2px solid #fff;
+    }
+    .avatar-circle .status-dot.offline { background: #cbd5e1; }
+    .top-action-row { display: flex; align-items: center; gap: 6px; }
+    .pill-icon-btn {
+      padding: 6px 10px; border-radius: 999px; background: var(--panel-alt); color: var(--muted);
+      font-size: 0.78rem; font-weight: 600; transition: all 0.15s;
+    }
+    .pill-icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
+
+    .chats-title-row {
+      padding: 16px 16px 8px; display: flex; align-items: center; justify-content: space-between;
+    }
+    .chats-title-row h2 { font-size: 1.3rem; font-weight: 700; color: var(--text); }
+    .plus-fab {
+      width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: #fff;
+      font-size: 1.2rem; font-weight: 700; display: inline-flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 10px rgba(124, 58, 237, 0.3);
+    }
+
+    .filter-tabs {
+      padding: 4px 16px 10px; display: flex; gap: 14px; font-size: 0.72rem; font-weight: 700;
+      letter-spacing: 0.06em; color: var(--muted);
+    }
+    .filter-tab { padding-bottom: 4px; border-bottom: 2px solid transparent; }
+    .filter-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    .search-wrap { padding: 0 16px 10px; }
+    .search-input {
+      width: 100%; padding: 9px 14px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--panel); color: var(--text); font-size: 0.88rem; outline: none;
+    }
+    .search-input:focus { border-color: var(--accent); }
+
+    .list-scroll { overflow-y: auto; flex: 1; padding: 0 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+    .section-label {
+      padding: 6px 6px 2px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--muted);
+    }
+    .chat-item {
+      padding: 10px 12px; border-radius: 14px; background: var(--panel); border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer;
+      transition: transform 0.1s, box-shadow 0.15s;
+    }
+    .chat-item:hover { box-shadow: 0 4px 12px rgba(15, 23, 42, 0.06); }
+    .chat-item.active {
+      background: var(--dark-card); color: #ffffff; border-color: var(--dark-card);
+      box-shadow: 0 8px 20px rgba(38, 41, 56, 0.22);
+    }
+    .chat-item.active .chat-sub { color: #94a3b8; }
+    .chat-item-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .chat-name { font-weight: 600; font-size: 0.92rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-sub { font-size: 0.76rem; color: var(--muted); margin-top: 2px; }
+    .unread-pill {
+      background: var(--accent); color: #ffffff; font-size: 0.72rem; font-weight: 700;
+      min-width: 22px; height: 22px; padding: 0 6px; border-radius: 999px;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+
+    /* Center Chat Pane */
+    .main { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--panel); }
+    .chat-header {
+      padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .chat-title { font-weight: 700; font-size: 1rem; color: var(--text); }
+    .chat-status { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .header-actions { display: flex; align-items: center; gap: 6px; position: relative; }
+    .icon-btn {
+      padding: 7px 11px; border-radius: 999px; background: var(--panel-alt); color: var(--text);
+      font-size: 0.84rem; font-weight: 500; transition: background 0.15s;
+    }
+    .icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
+    .icon-btn.recording { background: var(--error); color: #fff; font-weight: 600; }
+
     #pull-refresh-circle {
       position: absolute; top: 68px; left: 50%; z-index: 40;
       width: 38px; height: 38px; border-radius: 50%;
-      background: var(--panel-alt); border: 1px solid var(--border);
-      box-shadow: 0 4px 14px rgba(0,0,0,0.45);
+      background: var(--panel); border: 1px solid var(--border);
+      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.15);
       display: flex; align-items: center; justify-content: center;
       color: var(--muted); opacity: 0; pointer-events: none;
       transform: translate(-50%, -48px) scale(0.8);
@@ -1176,110 +1370,43 @@ OFFLINE_HTML = """<!DOCTYPE html>
     #pull-refresh-circle.ready { color: var(--accent); border-color: var(--accent); }
     #pull-refresh-circle.spinning svg { animation: lan-spin 0.7s linear infinite; }
     @keyframes lan-spin { to { transform: rotate(360deg); } }
-    button { cursor: pointer; border: none; background: none; color: inherit; }
 
-    #login-screen {
-      position: fixed; inset: 0; background: var(--bg); display: flex;
-      align-items: center; justify-content: center; z-index: 50; padding: 16px;
-    }
-    .login-card {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
-      padding: 28px; width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 12px;
-    }
-    .login-card h1 { font-size: 1.35rem; color: var(--accent); }
-    .login-card p { font-size: 0.9rem; color: var(--muted); line-height: 1.4; }
-    .login-card input {
-      padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border);
-      background: var(--panel-alt); color: var(--text); font-size: 1rem; outline: none;
-    }
-    .login-error { color: var(--error); font-size: 0.85rem; min-height: 18px; }
-    .primary-btn {
-      background: var(--accent); color: #0b141a; font-weight: 600; padding: 11px 16px;
-      border-radius: 8px; font-size: 0.95rem;
-    }
-
-    #app { display: none; width: 100%; height: 100%; overflow: hidden; }
-    .sidebar {
-      width: 310px; background: var(--panel); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; flex-shrink: 0;
-    }
-    .sidebar-header {
-      padding: 14px 16px; background: var(--panel-alt); display: flex;
-      align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border);
-    }
-    .user-badge { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-    .logout-btn { font-size: 0.78rem; color: var(--muted); padding: 4px 8px; border-radius: 6px; background: rgba(255,255,255,0.06); }
-    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); display: inline-block; }
-    .dot.offline { background: var(--muted); }
-    .section-title {
-      padding: 12px 16px 6px; font-size: 0.75rem; text-transform: uppercase;
-      letter-spacing: 0.06em; color: var(--accent); display: flex; justify-content: space-between; align-items: center;
-    }
-    .list-scroll { overflow-y: auto; flex: 1; }
-    .chat-item {
-      padding: 12px 16px; display: flex; align-items: center; justify-content: space-between;
-      border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer;
-    }
-    .chat-item:hover { background: rgba(255,255,255,0.04); }
-    .chat-item.active { background: var(--panel-alt); }
-    .unread-pill {
-      background: var(--accent); color: #0b141a; font-size: 0.72rem; font-weight: 700;
-      padding: 2px 7px; border-radius: 999px;
-    }
-
-    .main { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
-    .chat-header {
-      padding: 14px 18px; background: var(--panel-alt); border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    }
-    .chat-title { font-weight: 600; font-size: 1rem; }
-    .chat-status { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
     .messages {
-      flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 8px;
+      flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 10px;
+      background: var(--panel);
     }
+    .msg-row {
+      position: relative; display: flex; align-items: center; gap: 6px;
+      align-self: flex-start; max-width: 78%;
+    }
+    .msg-row.me { align-self: flex-end; flex-direction: row-reverse; }
     .bubble {
-      max-width: 72%; padding: 8px 12px; border-radius: 10px; line-height: 1.4;
-      background: var(--incoming); align-self: flex-start; word-wrap: break-word;
+      max-width: 100%; padding: 10px 14px; border-radius: 18px; line-height: 1.42;
+      background: var(--incoming); color: var(--text); word-wrap: break-word;
+      border-bottom-left-radius: 4px;
     }
-    .bubble.me { background: var(--outgoing); align-self: flex-end; }
-    .bubble-sender { font-size: 0.75rem; font-weight: 600; color: var(--accent); margin-bottom: 3px; }
+    .bubble.me {
+      background: linear-gradient(135deg, #8b5cf6, #7c3aed); color: #ffffff;
+      border-bottom-left-radius: 18px; border-bottom-right-radius: 4px;
+    }
+    .bubble-sender { font-size: 0.74rem; font-weight: 700; color: var(--accent); margin-bottom: 3px; }
+    .bubble.me .bubble-sender { color: #ede9fe; }
     .bubble-meta {
       display: flex; align-items: center; justify-content: flex-end; gap: 5px;
       font-size: 0.68rem; color: var(--muted); margin-top: 4px;
     }
+    .bubble.me .bubble-meta { color: rgba(255,255,255,0.8); }
     .ticks { font-weight: 700; letter-spacing: -1px; }
     .ticks.read { color: var(--read-blue); }
-    .bubble img { max-width: 260px; max-height: 260px; border-radius: 8px; display: block; margin-top: 4px; }
-    .file-link {
-      display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; margin-top: 4px;
-      background: rgba(0,0,0,0.25); border-radius: 8px; color: var(--text); text-decoration: none; font-size: 0.88rem;
-    }
-    .composer {
-      padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
-      background: var(--panel-alt); border-top: 1px solid var(--border);
-      display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
-    }
-    .composer input[type="text"] {
-      flex: 1 1 0%; width: 0; min-width: 0; padding: 11px 12px; border-radius: 8px; border: none;
-      background: #2a3942; color: var(--text); font-size: 0.96rem; outline: none;
-    }
-    .composer button { flex-shrink: 0; }
-    .back-btn {
-      display: none; padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,0.08);
-      font-size: 1rem; font-weight: 700; flex-shrink: 0;
-    }
-    .icon-btn {
-      padding: 8px 11px; border-radius: 8px; background: #2a3942; color: var(--text); font-size: 0.9rem;
-    }
-    .icon-btn.recording { background: var(--error); color: #fff; font-weight: 600; }
+    .bubble img { max-width: 250px; max-height: 250px; border-radius: 12px; display: block; margin-top: 4px; }
     .bubble audio { width: 220px; max-width: 100%; height: 36px; margin-top: 4px; display: block; }
-
-    .msg-row {
-      position: relative; display: flex; align-items: center; gap: 6px;
-      align-self: flex-start; max-width: 80%;
+    .file-link {
+      display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px; margin-top: 4px;
+      background: rgba(15, 23, 42, 0.08); border-radius: 10px; color: inherit; text-decoration: none; font-size: 0.86rem;
     }
-    .msg-row.me { align-self: flex-end; flex-direction: row-reverse; }
-    .msg-row .bubble { max-width: 100%; }
+    .bubble.me .file-link { background: rgba(255, 255, 255, 0.18); color: #fff; }
+    .pdf-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+
     .menu-trigger {
       opacity: 0; width: 26px; height: 26px; border-radius: 50%;
       display: inline-flex; align-items: center; justify-content: center;
@@ -1290,108 +1417,208 @@ OFFLINE_HTML = """<!DOCTYPE html>
     @media (hover: none) { .menu-trigger { opacity: 0.75; } }
     .msg-menu {
       display: none; position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
-      min-width: 165px; background: var(--panel-alt); border: 1px solid var(--border);
-      border-radius: 10px; padding: 4px; box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+      min-width: 170px; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 12px; padding: 5px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
       flex-direction: column;
     }
     .msg-row.me .msg-menu { left: auto; right: 0; }
     .msg-row.menu-up .msg-menu { top: auto; bottom: calc(100% + 4px); }
     .msg-row.menu-open .msg-menu { display: flex; }
     .msg-menu button {
-      text-align: left; padding: 8px 12px; border-radius: 6px; font-size: 0.86rem; color: var(--text);
+      text-align: left; padding: 8px 12px; border-radius: 8px; font-size: 0.85rem; color: var(--text);
     }
-    .msg-menu button:hover { background: rgba(255,255,255,0.08); }
+    .msg-menu button:hover { background: var(--panel-alt); }
     .msg-menu button.danger { color: var(--error); }
-    .deleted-msg { font-style: italic; color: var(--muted); font-size: 0.9rem; }
+    .deleted-msg { font-style: italic; color: var(--muted); font-size: 0.88rem; }
+    .bubble.me .deleted-msg { color: rgba(255,255,255,0.75); }
     .reply-quote {
-      border-left: 3px solid var(--accent); background: rgba(0,0,0,0.22);
-      padding: 5px 8px; border-radius: 6px; margin-bottom: 6px; cursor: pointer; font-size: 0.82rem;
+      border-left: 3px solid var(--accent); background: rgba(15, 23, 42, 0.06);
+      padding: 5px 8px; border-radius: 8px; margin-bottom: 6px; cursor: pointer; font-size: 0.82rem;
     }
-    .reply-quote-sender { font-weight: 600; color: var(--accent); font-size: 0.75rem; }
+    .bubble.me .reply-quote { border-left-color: #fff; background: rgba(255, 255, 255, 0.16); }
+    .reply-quote-sender { font-weight: 700; color: var(--accent); font-size: 0.74rem; }
+    .bubble.me .reply-quote-sender { color: #ede9fe; }
     .reply-quote-text { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
+    .bubble.me .reply-quote-text { color: rgba(255,255,255,0.85); }
     .reaction-bar { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
     .rx-chip {
-      background: var(--panel-alt); border: 1px solid var(--border); border-radius: 999px;
-      padding: 1px 7px; font-size: 0.78rem; color: var(--text);
+      background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
+      padding: 2px 8px; font-size: 0.76rem; color: var(--text); box-shadow: 0 2px 6px rgba(0,0,0,0.05);
     }
     .menu-emojis {
       display: flex; justify-content: space-between; gap: 2px; padding: 4px 6px;
       border-bottom: 1px solid var(--border); margin-bottom: 2px;
     }
     .menu-emojis button { padding: 4px; font-size: 1rem; border-radius: 6px; text-align: center; }
+    .edited-tag { font-style: italic; opacity: 0.75; font-size: 0.68rem; }
+    .msg-highlight .bubble { outline: 2px solid var(--accent); }
+
     #reply-bar {
       display: none; align-items: center; justify-content: space-between; gap: 10px;
-      padding: 8px 14px; background: var(--panel); border-top: 1px solid var(--border);
+      padding: 8px 16px; background: var(--panel-alt); border-top: 1px solid var(--border);
       border-left: 4px solid var(--accent);
     }
     #reply-bar.active { display: flex; }
     #upload-progress-wrap {
       display: none; flex-direction: column; gap: 4px;
-      padding: 6px 14px; background: var(--panel); border-top: 1px solid var(--border);
+      padding: 6px 16px; background: var(--panel-alt); border-top: 1px solid var(--border);
     }
     #upload-progress-wrap.active { display: flex; }
     .progress-label { font-size: 0.78rem; color: var(--muted); display: flex; justify-content: space-between; }
-    .progress-track { width: 100%; height: 5px; background: var(--panel-alt); border-radius: 999px; overflow: hidden; }
+    .progress-track { width: 100%; height: 5px; background: var(--border); border-radius: 999px; overflow: hidden; }
     .progress-fill { width: 0%; height: 100%; background: var(--accent); transition: width 0.1s linear; }
-    .msg-highlight .bubble { outline: 2px solid var(--accent); }
-    .edited-tag { font-style: italic; color: var(--muted); font-size: 0.68rem; }
-    .header-actions { display: flex; align-items: center; gap: 8px; }
-    .pdf-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
-    #invite-modal {
+
+    /* Pill Composer */
+    .composer-wrap {
+      padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+      background: var(--panel); border-top: 1px solid var(--border);
+    }
+    .composer {
+      display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
+      background: var(--panel-alt); border: 1px solid var(--border); border-radius: 999px;
+      padding: 5px 6px 5px 10px;
+    }
+    .composer input[type="text"] {
+      flex: 1 1 0%; width: 0; min-width: 0; padding: 8px 6px; border: none;
+      background: transparent; color: var(--text); font-size: 0.95rem; outline: none;
+    }
+    .composer button { flex-shrink: 0; }
+    .send-circle-btn {
+      width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+      color: #fff; display: inline-flex; align-items: center; justify-content: center; font-size: 0.95rem;
+      box-shadow: 0 3px 10px rgba(124, 58, 237, 0.28);
+    }
+    .back-btn {
+      display: none; padding: 6px 10px; border-radius: 999px; background: var(--panel-alt);
+      font-size: 1rem; font-weight: 700; flex-shrink: 0;
+    }
+
+    /* Right Panel: Notifications & Quick People */
+    .right-panel {
+      width: 290px; background: var(--bg); border-left: 1px solid var(--border);
+      display: flex; flex-direction: column; padding: 16px; gap: 18px; overflow-y: auto; flex-shrink: 0;
+    }
+    .right-panel h3 { font-size: 1.05rem; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+    .notif-list, .quick-people-list { display: flex; flex-direction: column; gap: 10px; }
+    .notif-item {
+      display: flex; align-items: flex-start; gap: 10px; font-size: 0.82rem; color: var(--text); line-height: 1.35;
+    }
+    .notif-time { font-size: 0.72rem; color: var(--muted); }
+    .quick-person {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      background: var(--panel); padding: 8px 10px; border-radius: 12px; border: 1px solid var(--border);
+    }
+    .quick-chat-btn {
+      background: var(--accent); color: #fff; font-size: 0.75rem; font-weight: 600;
+      padding: 5px 12px; border-radius: 999px;
+    }
+
+    /* In-Room Message Search Bar */
+    #msg-search-bar {
+      display: none; align-items: center; gap: 8px; padding: 8px 16px;
+      background: var(--panel-alt); border-bottom: 1px solid var(--border);
+    }
+    #msg-search-bar.active { display: flex; }
+    #msg-search-input {
+      flex: 1; min-width: 0; padding: 7px 12px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--panel); color: var(--text);
+      font-size: 0.88rem; outline: none;
+    }
+    #msg-search-input:focus { border-color: var(--accent); }
+    .search-count { font-size: 0.78rem; color: var(--muted); white-space: nowrap; min-width: 48px; text-align: center; }
+    .msg-search-match .bubble { outline: 2px dashed var(--accent); }
+    .msg-search-current .bubble { outline: 3px solid var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+
+    /* Vault Modal & Cards */
+    #vault-modal {
+      display: none; position: fixed; inset: 0; z-index: 66;
+      background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px);
+      align-items: center; justify-content: center; padding: 16px;
+    }
+    #vault-modal.active { display: flex; }
+    .vault-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 18px;
+      padding: 20px; width: 100%; max-width: 640px; max-height: 84vh;
+      display: flex; flex-direction: column; gap: 12px; box-shadow: 0 20px 50px rgba(0,0,0,0.22);
+    }
+    .vault-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .vault-controls { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .vault-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+    .vault-tab {
+      padding: 6px 12px; border-radius: 999px; background: var(--panel-alt); color: var(--muted);
+      font-size: 0.78rem; font-weight: 600;
+    }
+    .vault-tab.active { background: var(--accent); color: #fff; }
+    .vault-search {
+      flex: 1; min-width: 160px; padding: 7px 12px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--panel-alt); color: var(--text);
+      font-size: 0.85rem; outline: none;
+    }
+    .vault-list {
+      flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px;
+    }
+    .vault-item {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 12px; border-radius: 12px; background: var(--panel-alt); border: 1px solid var(--border);
+    }
+    .vault-item-left { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+    .vault-thumb {
+      width: 42px; height: 42px; border-radius: 10px; background: var(--accent-soft); color: var(--accent);
+      display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.78rem;
+      flex-shrink: 0; overflow: hidden;
+    }
+    .vault-thumb img { width: 100%; height: 100%; object-fit: cover; }
+    .vault-meta { min-width: 0; flex: 1; }
+    .vault-fname { font-weight: 600; font-size: 0.88rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .vault-sub { font-size: 0.74rem; color: var(--muted); margin-top: 2px; }
+    .vault-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
+
+    /* Modals */
+    #invite-modal, #call-modal, #pdf-modal {
       display: none; position: fixed; inset: 0; z-index: 65;
-      background: rgba(11, 20, 26, 0.92); align-items: center; justify-content: center; padding: 16px;
+      background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px);
+      align-items: center; justify-content: center; padding: 16px;
     }
-    #invite-modal.active { display: flex; }
-    .invite-card {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
-      padding: 22px; width: 100%; max-width: 380px; display: flex; flex-direction: column;
-      gap: 12px; align-items: center; text-align: center;
+    #invite-modal.active, #call-modal.active, #pdf-modal.active { display: flex; }
+    #pdf-modal { flex-direction: column; padding: 0; z-index: 70; background: #0f172a; }
+    .invite-card, .call-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 18px;
+      padding: 22px; width: 100%; max-width: 400px; display: flex; flex-direction: column;
+      gap: 12px; align-items: center; text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.2);
     }
+    .call-card { max-width: 520px; }
     .invite-qr-box {
-      background: #ffffff; padding: 10px; border-radius: 12px; width: 200px; height: 200px;
-      display: flex; align-items: center; justify-content: center;
+      background: #ffffff; padding: 10px; border-radius: 12px; border: 1px solid var(--border);
+      width: 200px; height: 200px; display: flex; align-items: center; justify-content: center;
     }
     .invite-qr-box img { width: 100%; height: 100%; }
     .invite-url {
-      width: 100%; padding: 8px 10px; border-radius: 8px; background: var(--panel-alt);
-      font-family: monospace; font-size: 0.85rem; word-break: break-all; color: var(--accent);
-    }
-
-    #pdf-modal {
-      display: none; position: fixed; inset: 0; z-index: 70;
-      background: rgba(11, 20, 26, 0.94); flex-direction: column;
-    }
-    #pdf-modal.active { display: flex; }
-    .pdf-toolbar {
-      display: flex; align-items: center; justify-content: space-between; gap: 10px;
-      padding: 10px 14px; background: var(--panel-alt); border-bottom: 1px solid var(--border);
-    }
-    .pdf-title { font-weight: 600; font-size: 0.95rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #pdf-frame { flex: 1; width: 100%; border: none; background: #1e293b; }
-
-    #call-modal {
-      display: none; position: fixed; inset: 0; z-index: 60;
-      background: rgba(11, 20, 26, 0.92); align-items: center; justify-content: center; padding: 16px;
-    }
-    #call-modal.active { display: flex; }
-    .call-card {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
-      padding: 20px; width: 100%; max-width: 520px; display: flex; flex-direction: column; gap: 14px; align-items: center;
+      width: 100%; padding: 8px 10px; border-radius: 10px; background: var(--panel-alt);
+      font-family: monospace; font-size: 0.84rem; word-break: break-all; color: var(--accent);
     }
     .call-videos {
-      position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; min-height: 220px;
+      position: relative; width: 100%; background: #0f172a; border-radius: 14px; overflow: hidden; min-height: 220px;
       display: flex; align-items: center; justify-content: center;
     }
     #remote-video { width: 100%; max-height: 340px; object-fit: cover; }
     #local-video {
-      position: absolute; bottom: 10px; right: 10px; width: 120px; border-radius: 8px;
+      position: absolute; bottom: 10px; right: 10px; width: 120px; border-radius: 10px;
       border: 2px solid var(--accent); background: #111;
     }
     .call-controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
     .danger-btn {
-      background: var(--error); color: #fff; font-weight: 600; padding: 10px 18px; border-radius: 8px;
+      background: var(--error); color: #fff; font-weight: 600; padding: 10px 18px; border-radius: 10px;
     }
+    .pdf-toolbar {
+      width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+    }
+    .pdf-title { font-weight: 600; font-size: 0.95rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #pdf-frame { flex: 1; width: 100%; border: none; background: #1e293b; }
 
+    @media (max-width: 1080px) {
+      .right-panel { display: none; }
+    }
     @media (max-width: 768px) {
       .sidebar { width: 100%; border-right: none; }
       .main { display: none; width: 100%; }
@@ -1400,13 +1627,11 @@ OFFLINE_HTML = """<!DOCTYPE html>
       .back-btn { display: inline-flex; align-items: center; justify-content: center; }
       .chat-header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
       .header-actions { flex-wrap: wrap; gap: 6px; }
-      .header-actions .icon-btn { padding: 6px 9px; font-size: 0.8rem; }
+      .header-actions .icon-btn { padding: 6px 9px; font-size: 0.78rem; }
       .msg-row { max-width: 90%; }
-      .bubble { max-width: 100%; }
       .bubble img { max-width: 210px; max-height: 210px; }
-      .composer { gap: 6px; padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px)); }
-      .composer .icon-btn { padding: 8px 9px; font-size: 0.84rem; }
-      .composer .primary-btn { padding: 9px 12px; font-size: 0.88rem; }
+      .composer-wrap { padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); }
+      .composer .icon-btn { padding: 6px 8px; font-size: 0.8rem; }
     }
   </style>
 </head>
@@ -1424,22 +1649,38 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
   <div id="app">
     <aside class="sidebar">
-      <div class="sidebar-header">
-        <div class="user-badge"><span class="dot"></span><span id="me-label"></span></div>
-        <div style="display:flex;gap:6px;">
-          <button class="logout-btn" id="invite-btn" title="Share join URL & QR">Invite</button>
-          <button class="logout-btn" id="logout-btn">Logout</button>
+      <div class="sidebar-top-icons">
+        <div class="user-badge">
+          <div class="avatar-circle" id="me-avatar">U<span class="status-dot"></span></div>
+          <span id="me-label"></span>
+        </div>
+        <div class="top-action-row">
+          <button class="pill-icon-btn" id="invite-btn" title="Share join URL & QR">Invite</button>
+          <button class="pill-icon-btn" id="logout-btn">Logout</button>
         </div>
       </div>
-      <div class="list-scroll">
-        <div class="section-title">
-          <span>Groups</span>
-          <button id="new-group-btn" title="Create group" style="color:var(--accent);font-weight:700;">+ New</button>
-        </div>
-        <div id="groups-list"></div>
 
-        <div class="section-title"><span>People (1-on-1)</span></div>
-        <div id="users-list"></div>
+      <div class="chats-title-row">
+        <h2>Chats</h2>
+        <button class="plus-fab" id="new-group-btn" title="Create new group">+</button>
+      </div>
+
+      <div class="filter-tabs" id="filter-tabs">
+        <button type="button" class="filter-tab active" data-filter="all">ALL</button>
+        <button type="button" class="filter-tab" data-filter="direct">DIRECT</button>
+        <button type="button" class="filter-tab" data-filter="groups">GROUPS</button>
+      </div>
+
+      <div class="search-wrap">
+        <input type="text" class="search-input" id="sidebar-search" placeholder="Search chats or people..." />
+      </div>
+
+      <div class="list-scroll">
+        <div class="section-label" id="groups-label">Groups</div>
+        <div id="groups-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+
+        <div class="section-label" id="users-label" style="margin-top:6px;">People (1-on-1)</div>
+        <div id="users-list" style="display:flex;flex-direction:column;gap:8px;"></div>
       </div>
     </aside>
 
@@ -1447,18 +1688,29 @@ OFFLINE_HTML = """<!DOCTYPE html>
       <div class="chat-header">
         <div style="display:flex;align-items:center;gap:10px;min-width:0;">
           <button type="button" class="back-btn" id="back-to-chats-btn" title="Back to chats">←</button>
+          <div class="avatar-circle" id="header-avatar">G</div>
           <div style="min-width:0;">
             <div class="chat-title" id="active-room-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">General</div>
             <div class="chat-status" id="active-room-status">Group chat</div>
           </div>
         </div>
         <div class="header-actions">
+          <button type="button" class="icon-btn" id="msg-search-btn" title="Search messages in this chat (Ctrl+F)">Search</button>
+          <button type="button" class="icon-btn" id="vault-btn" title="Shared Files, PDFs & Media Vault">Files</button>
           <button type="button" class="icon-btn" id="group-invite-btn" title="Invite others to this group">Invite</button>
-          <button type="button" class="icon-btn" id="voice-call-btn" style="display:none;">Call</button>
-          <button type="button" class="icon-btn" id="video-call-btn" style="display:none;">Video</button>
-          <button type="button" class="icon-btn" id="clear-chat-btn">Clear Chat</button>
+          <button type="button" class="icon-btn" id="voice-call-btn" style="display:none;" title="Voice call">Call</button>
+          <button type="button" class="icon-btn" id="video-call-btn" style="display:none;" title="Video call">Video</button>
+          <button type="button" class="icon-btn" id="clear-chat-btn">Clear</button>
           <button type="button" class="icon-btn" id="sound-toggle-btn">Sound: On</button>
         </div>
+      </div>
+
+      <div id="msg-search-bar">
+        <input type="text" id="msg-search-input" placeholder="Search messages, sender, or filenames in this room..." autocomplete="off" />
+        <span class="search-count" id="msg-search-count">0 / 0</span>
+        <button type="button" class="icon-btn" id="msg-search-prev" title="Previous match">↑</button>
+        <button type="button" class="icon-btn" id="msg-search-next" title="Next match">↓</button>
+        <button type="button" class="icon-btn" id="msg-search-close" title="Close search">×</button>
       </div>
 
       <div id="pull-refresh-circle" aria-hidden="true">
@@ -1485,14 +1737,60 @@ OFFLINE_HTML = """<!DOCTYPE html>
         <div class="progress-track"><div class="progress-fill" id="upload-progress-fill"></div></div>
       </div>
 
-      <form class="composer" id="composer">
-        <input type="file" id="file-input" hidden />
-        <button type="button" class="icon-btn" id="attach-btn" title="Send file or image (max 50 MB)">Attach</button>
-        <button type="button" class="icon-btn" id="record-btn" title="Record voice note">Mic</button>
-        <input type="text" id="msg-input" placeholder="Type a message..." autocomplete="off" />
-        <button type="submit" class="primary-btn">Send</button>
-      </form>
+      <div class="composer-wrap">
+        <form class="composer" id="composer">
+          <input type="file" id="file-input" hidden />
+          <button type="button" class="icon-btn" id="attach-btn" title="Send file or image (max 50 MB)">Attach</button>
+          <button type="button" class="icon-btn" id="record-btn" title="Record voice note">Mic</button>
+          <input type="text" id="msg-input" placeholder="Type a message here..." autocomplete="off" />
+          <button type="submit" class="send-circle-btn" title="Send">➤</button>
+        </form>
+      </div>
     </main>
+
+    <aside class="right-panel">
+      <div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+          <h3 style="margin-bottom:0;">Shared Files & PDFs</h3>
+          <button type="button" class="pill-icon-btn" id="right-vault-btn">View All</button>
+        </div>
+        <div class="quick-people-list" id="quick-files-list">
+          <div class="notif-item" style="color:var(--muted);">No files shared in this room yet.</div>
+        </div>
+      </div>
+      <div>
+        <h3>Notifications</h3>
+        <div class="notif-list" id="notif-feed">
+          <div class="notif-item" style="color:var(--muted);">Activity on your LAN will appear here.</div>
+        </div>
+      </div>
+      <div>
+        <h3>People on LAN</h3>
+        <div class="quick-people-list" id="quick-people-list"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div id="vault-modal">
+    <div class="vault-card">
+      <div class="vault-header">
+        <div>
+          <div class="chat-title" id="vault-room-title">Shared Files & PDF Vault</div>
+          <div class="chat-status" id="vault-room-sub">Decrypted locally in your browser</div>
+        </div>
+        <button type="button" class="icon-btn" id="vault-close-btn">Close</button>
+      </div>
+      <div class="vault-controls">
+        <div class="vault-tabs" id="vault-tabs">
+          <button type="button" class="vault-tab active" data-vtab="all">All</button>
+          <button type="button" class="vault-tab" data-vtab="docs">PDFs & Docs</button>
+          <button type="button" class="vault-tab" data-vtab="images">Images</button>
+          <button type="button" class="vault-tab" data-vtab="audio">Voice / Audio</button>
+        </div>
+        <input type="text" class="vault-search" id="vault-search-input" placeholder="Filter by filename or sender..." />
+      </div>
+      <div class="vault-list" id="vault-list"></div>
+    </div>
   </div>
 
   <div id="invite-modal">
@@ -1541,6 +1839,32 @@ OFFLINE_HTML = """<!DOCTYPE html>
     let activeRoom = { id: "group:general", name: "General", isGroup: true, peer: null };
     let rooms = [];
     let users = [];
+    let roomMessages = [];
+    const roomCache = {};
+
+    function saveRoomCache(roomId, msgs) {
+      roomCache[roomId] = msgs.slice(-100);
+      try {
+        // Persist decrypted text/metadata (strip transient blob: URLs so they re-resolve cleanly)
+        const serializable = roomCache[roomId].map(m => ({
+          ...m,
+          file_url: m.orig_file_url || m.file_url,
+        }));
+        localStorage.setItem(`lan_chat_cache_${me}_${roomId}`, JSON.stringify(serializable));
+      } catch {}
+    }
+
+    function loadRoomCache(roomId) {
+      if (roomCache[roomId]) return roomCache[roomId];
+      try {
+        const raw = localStorage.getItem(`lan_chat_cache_${me}_${roomId}`);
+        if (raw) {
+          roomCache[roomId] = JSON.parse(raw);
+          return roomCache[roomId];
+        }
+      } catch {}
+      return null;
+    }
     let unread = {};
     let replyTo = null;
     let typingTimer = null;
@@ -1764,8 +2088,11 @@ OFFLINE_HTML = """<!DOCTYPE html>
       return map[ext] || "application/octet-stream";
     }
 
+    const decryptedBlobCache = {};
+
     async function decryptMediaUrl(roomId, fileUrl, fileName) {
       if (!fileUrl || !fileUrl.endsWith(".enc")) return fileUrl;
+      if (decryptedBlobCache[fileUrl]) return decryptedBlobCache[fileUrl];
       try {
         const key = await getRoomAesKey(roomId);
         if (!key) return fileUrl;
@@ -1775,7 +2102,9 @@ OFFLINE_HTML = """<!DOCTYPE html>
         const cipher = new Uint8Array(buf, 12);
         const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipher);
         const blob = new Blob([plain], { type: guessMimeType(fileName) });
-        return URL.createObjectURL(blob);
+        const blobUrl = URL.createObjectURL(blob);
+        decryptedBlobCache[fileUrl] = blobUrl;
+        return blobUrl;
       } catch {
         return fileUrl;
       }
@@ -1828,6 +2157,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
       if (openMobileChat) appEl.classList.add("chat-open");
       unread[room.id] = 0;
       document.getElementById("active-room-title").textContent = room.name;
+      document.getElementById("header-avatar").textContent = (room.name[0] || "C").toUpperCase();
       const roomKey = await getRoomAesKey(room.id);
       const hasE2EE = roomKey !== null;
       document.getElementById("active-room-status").textContent = room.isGroup
@@ -1843,16 +2173,66 @@ OFFLINE_HTML = """<!DOCTYPE html>
       document.getElementById("video-call-btn").style.display = showCallBtns ? "inline-flex" : "none";
       renderSidebar();
 
-      const res = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/messages`, { headers: authHeaders() });
-      const data = await res.json();
-      messagesEl.innerHTML = "";
-      for (const m of (data.messages || [])) {
-        m.content = await decryptContent(m.room_id, m.content);
-        if (m.reply_preview) m.reply_preview = await decryptContent(m.room_id, m.reply_preview);
-        if (m.file_url && m.file_url.endsWith(".enc")) {
-          m.file_url = await decryptMediaUrl(m.room_id, m.file_url, m.file_name);
+      const cached = loadRoomCache(room.id);
+      if (cached && cached.length > 0) {
+        await Promise.all(cached.map(async (m) => {
+          if (m.file_url && m.file_url.endsWith(".enc") && (m.msg_type === "image" || m.msg_type === "audio")) {
+            m.orig_file_url = m.file_url;
+            m.file_url = await decryptMediaUrl(m.room_id, m.file_url, m.file_name);
+          }
+        }));
+        messagesEl.innerHTML = "";
+        roomMessages = [];
+        const loadBtn = document.createElement("button");
+        loadBtn.type = "button";
+        loadBtn.className = "icon-btn";
+        loadBtn.style.alignSelf = "center";
+        loadBtn.textContent = "Load older messages";
+        loadBtn.onclick = () => loadOlderMessages(loadBtn);
+        messagesEl.appendChild(loadBtn);
+        cached.forEach(m => appendMessage(m, true));
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        renderQuickFiles();
+      } else {
+        messagesEl.innerHTML = "";
+        roomMessages = [];
+      }
+
+      const lastId = roomMessages.length > 0 ? roomMessages[roomMessages.length - 1].id : null;
+      const query = lastId ? `limit=50&after_id=${lastId}` : "limit=50";
+      try {
+        const res = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/messages?${query}`, { headers: authHeaders() });
+        const data = await res.json();
+        const fresh = data.messages || [];
+        await Promise.all(fresh.map(async (m) => {
+          m.content = await decryptContent(m.room_id, m.content);
+          if (m.reply_preview) m.reply_preview = await decryptContent(m.room_id, m.reply_preview);
+          if (m.file_url && m.file_url.endsWith(".enc") && (m.msg_type === "image" || m.msg_type === "audio")) {
+            m.orig_file_url = m.file_url;
+            m.file_url = await decryptMediaUrl(m.room_id, m.file_url, m.file_name);
+          }
+        }));
+        if (!lastId && fresh.length >= 50) {
+          const loadBtn = document.createElement("button");
+          loadBtn.type = "button";
+          loadBtn.className = "icon-btn";
+          loadBtn.style.alignSelf = "center";
+          loadBtn.textContent = "Load older messages";
+          loadBtn.onclick = () => loadOlderMessages(loadBtn);
+          messagesEl.prepend(loadBtn);
         }
-        appendMessage(m);
+        fresh.forEach(m => {
+          if (!roomMessages.some(x => x.id === m.id)) appendMessage(m, true);
+        });
+        if (fresh.length > 0 || !cached) {
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          renderQuickFiles();
+        }
+        saveRoomCache(room.id, roomMessages);
+      } catch {}
+
+      if (document.getElementById("msg-search-bar").classList.contains("active")) {
+        runRoomSearch();
       }
       sendMarkRead(room.id);
     }
@@ -1879,11 +2259,12 @@ OFFLINE_HTML = """<!DOCTYPE html>
         } else if (m.msg_type === "file" && m.file_url) {
           const fname = m.file_name || "Download file";
           if (fname.toLowerCase().endsWith(".pdf")) {
-            const viewUrl = m.file_url.startsWith("blob:") ? m.file_url : `${m.file_url}?inline=true`;
             body += `<div class="pdf-actions">` +
-              `<button type="button" class="file-link" onclick="openPdfViewer('${viewUrl}', '${escapeHtml(fname)}', '${m.file_url}')">📄 View ${escapeHtml(fname)}</button>` +
-              `<a class="file-link" href="${m.file_url}" download="${escapeHtml(fname)}">Download</a>` +
+              `<button type="button" class="file-link" onclick="openLazyPdf('${m.room_id}', '${m.file_url}', '${escapeHtml(fname)}')">📄 View ${escapeHtml(fname)}</button>` +
+              `<button type="button" class="file-link" onclick="downloadLazyFile('${m.room_id}', '${m.file_url}', '${escapeHtml(fname)}')">Download</button>` +
               `</div>`;
+          } else if (m.file_url.endsWith(".enc")) {
+            body += `<button type="button" class="file-link" onclick="downloadLazyFile('${m.room_id}', '${m.file_url}', '${escapeHtml(fname)}')">📎 Download ${escapeHtml(fname)}</button>`;
           } else {
             body += `<a class="file-link" href="${m.file_url}" download="${escapeHtml(fname)}">${escapeHtml(fname)}</a>`;
           }
@@ -1904,7 +2285,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
     }
     document.addEventListener("click", closeAllMenus);
 
-    function appendMessage(m) {
+    function appendMessage(m, skipExtras = false) {
       const isMe = m.sender === me;
       const row = document.createElement("div");
       row.className = "msg-row" + (isMe ? " me" : "");
@@ -1972,8 +2353,70 @@ OFFLINE_HTML = """<!DOCTYPE html>
       }
 
       messagesEl.appendChild(row);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      const existingIdx = roomMessages.findIndex(x => x.id === m.id);
+      if (existingIdx >= 0) roomMessages[existingIdx] = m;
+      else roomMessages.push(m);
+      if (!skipExtras) {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        renderQuickFiles();
+        saveRoomCache(m.room_id || activeRoom.id, roomMessages);
+      }
     }
+
+    async function loadOlderMessages(btn) {
+      if (roomMessages.length === 0) return;
+      btn.disabled = true;
+      btn.textContent = "Loading...";
+      const oldestId = roomMessages[0].id;
+      const res = await fetch(
+        `/api/rooms/${encodeURIComponent(activeRoom.id)}/messages?limit=50&before_id=${oldestId}`,
+        { headers: authHeaders() }
+      );
+      const data = await res.json();
+      const older = data.messages || [];
+      await Promise.all(older.map(async (m) => {
+        m.content = await decryptContent(m.room_id, m.content);
+        if (m.reply_preview) m.reply_preview = await decryptContent(m.room_id, m.reply_preview);
+        if (m.file_url && m.file_url.endsWith(".enc") && (m.msg_type === "image" || m.msg_type === "audio")) {
+          m.file_url = await decryptMediaUrl(m.room_id, m.file_url, m.file_name);
+        }
+      }));
+      btn.remove();
+      if (older.length > 0) {
+        const prevHeight = messagesEl.scrollHeight;
+        const saved = [...roomMessages];
+        messagesEl.innerHTML = "";
+        roomMessages = [];
+        if (older.length >= 50) {
+          const nextBtn = document.createElement("button");
+          nextBtn.type = "button";
+          nextBtn.className = "icon-btn";
+          nextBtn.style.alignSelf = "center";
+          nextBtn.textContent = "Load older messages";
+          nextBtn.onclick = () => loadOlderMessages(nextBtn);
+          messagesEl.appendChild(nextBtn);
+        }
+        [...older, ...saved].forEach(m => appendMessage(m, true));
+        messagesEl.scrollTop = messagesEl.scrollHeight - prevHeight;
+        renderQuickFiles();
+      }
+    }
+
+    window.openLazyPdf = async (roomId, fileUrl, fname) => {
+      const resolved = fileUrl.endsWith(".enc") ? await decryptMediaUrl(roomId, fileUrl, fname) : fileUrl;
+      const viewUrl = resolved.startsWith("blob:") ? resolved : `${resolved}?inline=true`;
+      openPdfViewer(viewUrl, fname, resolved);
+    };
+
+    window.downloadLazyFile = async (roomId, fileUrl, fname) => {
+      const resolved = fileUrl.endsWith(".enc") ? await decryptMediaUrl(roomId, fileUrl, fname) : fileUrl;
+      const a = document.createElement("a");
+      a.href = resolved;
+      a.download = fname || "download";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    };
 
     function renderReactionsInto(bar, msgId, reactions) {
       bar.innerHTML = "";
@@ -2063,35 +2506,114 @@ OFFLINE_HTML = """<!DOCTYPE html>
       });
     }
 
+    let sidebarFilter = "all";
+    let sidebarQuery = "";
+    const notifItems = [];
+
+    function pushNotif(text) {
+      const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      notifItems.unshift({ text, timeStr });
+      if (notifItems.length > 8) notifItems.pop();
+      const feed = document.getElementById("notif-feed");
+      if (!feed) return;
+      feed.innerHTML = notifItems.map(n =>
+        `<div class="notif-item"><div class="avatar-circle" style="width:28px;height:28px;font-size:0.75rem;">•</div>` +
+        `<div><div>${escapeHtml(n.text)}</div><div class="notif-time">${n.timeStr}</div></div></div>`
+      ).join("");
+    }
+
     function renderSidebar() {
+      const q = sidebarQuery.toLowerCase();
+      const showGroups = sidebarFilter === "all" || sidebarFilter === "groups";
+      const showDirect = sidebarFilter === "all" || sidebarFilter === "direct";
+
+      document.getElementById("groups-label").style.display = showGroups ? "block" : "none";
+      groupsList.style.display = showGroups ? "flex" : "none";
+      document.getElementById("users-label").style.display = showDirect ? "block" : "none";
+      usersList.style.display = showDirect ? "flex" : "none";
+
       groupsList.innerHTML = "";
-      rooms.forEach(r => {
+      rooms.filter(r => !q || r.name.toLowerCase().includes(q)).forEach(r => {
         const el = document.createElement("div");
         el.className = "chat-item" + (activeRoom.id === r.id ? " active" : "");
         const count = unread[r.id] || 0;
-        el.innerHTML = `<div><div># ${escapeHtml(r.name)}</div></div>` +
-          (count ? `<span class="unread-pill">${count}</span>` : "");
+        const init = (r.name[0] || "#").toUpperCase();
+        el.innerHTML = `
+          <div class="chat-item-left">
+            <div class="avatar-circle">${escapeHtml(init)}</div>
+            <div style="min-width:0;">
+              <div class="chat-name"># ${escapeHtml(r.name)}</div>
+              <div class="chat-sub">Group room</div>
+            </div>
+          </div>
+          ${count ? `<span class="unread-pill">${count}</span>` : ""}
+        `;
         el.onclick = () => selectRoom({ id: r.id, name: r.name, isGroup: true, createdBy: r.created_by || '', peer: null });
         groupsList.appendChild(el);
       });
 
+      const others = users.filter(u => u.username !== me);
       usersList.innerHTML = "";
-      users.filter(u => u.username !== me).forEach(u => {
+      others.filter(u => !q || u.username.toLowerCase().includes(q)).forEach(u => {
         const rid = dmRoomId(me, u.username);
         const el = document.createElement("div");
         el.className = "chat-item" + (activeRoom.id === rid ? " active" : "");
         const count = unread[rid] || 0;
+        const init = (u.username[0] || "U").toUpperCase();
         el.innerHTML = `
-          <div>
-            <div><span class="dot ${u.online ? "" : "offline"}"></span> ${escapeHtml(u.username)}</div>
-            <div class="chat-status">${u.online ? "Online" : "Offline"}</div>
+          <div class="chat-item-left">
+            <div class="avatar-circle">${escapeHtml(init)}<span class="status-dot ${u.online ? "" : "offline"}"></span></div>
+            <div style="min-width:0;">
+              <div class="chat-name">${escapeHtml(u.username)}</div>
+              <div class="chat-sub">${u.online ? "Online" : "Offline"}</div>
+            </div>
           </div>
           ${count ? `<span class="unread-pill">${count}</span>` : ""}
         `;
         el.onclick = () => selectRoom({ id: rid, name: u.username, isGroup: false, peer: u.username });
         usersList.appendChild(el);
       });
+
+      const qp = document.getElementById("quick-people-list");
+      if (qp) {
+        qp.innerHTML = "";
+        others.slice(0, 6).forEach(u => {
+          const rid = dmRoomId(me, u.username);
+          const row = document.createElement("div");
+          row.className = "quick-person";
+          const init = (u.username[0] || "U").toUpperCase();
+          row.innerHTML = `
+            <div class="chat-item-left">
+              <div class="avatar-circle" style="width:30px;height:30px;font-size:0.78rem;">${escapeHtml(init)}<span class="status-dot ${u.online ? "" : "offline"}"></span></div>
+              <div>
+                <div class="chat-name" style="font-size:0.84rem;">${escapeHtml(u.username)}</div>
+                <div class="chat-sub" style="font-size:0.7rem;">${u.online ? "Online" : "Offline"}</div>
+              </div>
+            </div>
+          `;
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "quick-chat-btn";
+          btn.textContent = "Chat";
+          btn.onclick = () => selectRoom({ id: rid, name: u.username, isGroup: false, peer: u.username });
+          row.appendChild(btn);
+          qp.appendChild(row);
+        });
+      }
     }
+
+    document.querySelectorAll("#filter-tabs .filter-tab").forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll("#filter-tabs .filter-tab").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        sidebarFilter = btn.dataset.filter || "all";
+        renderSidebar();
+      };
+    });
+    document.getElementById("sidebar-search").addEventListener("input", (e) => {
+      sidebarQuery = e.target.value.trim();
+      renderSidebar();
+    });
 
     function outboxKey() {
       return `lan_chat_outbox_${me}`;
@@ -2154,7 +2676,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
           const msg = data.message;
           msg.content = await decryptContent(msg.room_id, msg.content);
           if (msg.reply_preview) msg.reply_preview = await decryptContent(msg.room_id, msg.reply_preview);
-          if (msg.file_url && msg.file_url.endsWith(".enc")) {
+          if (msg.file_url && msg.file_url.endsWith(".enc") && (msg.msg_type === "image" || msg.msg_type === "audio")) {
             msg.file_url = await decryptMediaUrl(msg.room_id, msg.file_url, msg.file_name);
           }
           if (msg.room_id === activeRoom.id) {
@@ -2187,9 +2709,19 @@ OFFLINE_HTML = """<!DOCTYPE html>
             if (bubble) bubble.innerHTML = `<div class="deleted-msg">This message was deleted</div>`;
             row.querySelectorAll(".menu-trigger, .msg-menu").forEach(n => n.remove());
           }
+          const targetMsg = roomMessages.find(x => x.id === data.id);
+          if (targetMsg) {
+            targetMsg.deleted_for_all = 1;
+            targetMsg.content = "";
+            targetMsg.file_url = null;
+            targetMsg.file_name = null;
+          }
+          renderQuickFiles();
         } else if (data.type === "message_hidden") {
           const row = document.querySelector(`.msg-row[data-msg-id="${data.id}"]`);
           if (row) row.remove();
+          roomMessages = roomMessages.filter(x => x.id !== data.id);
+          renderQuickFiles();
         } else if (data.type === "room_deleted") {
           rooms = rooms.filter(r => r.id !== data.room_id);
           renderSidebar();
@@ -2213,6 +2745,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
       authToken = token;
       localStorage.setItem("lan_chat_auth", JSON.stringify({ username, token }));
       document.getElementById("me-label").textContent = me;
+      document.getElementById("me-avatar").firstChild.textContent = (me[0] || "U").toUpperCase();
       loginScreen.style.display = "none";
       appEl.style.display = "flex";
       if ("Notification" in window && Notification.permission === "default") {
@@ -2274,6 +2807,223 @@ OFFLINE_HTML = """<!DOCTYPE html>
         messagesEl.innerHTML = "";
       }
     };
+
+    // In-Room Message Search
+    const msgSearchBar = document.getElementById("msg-search-bar");
+    const msgSearchInput = document.getElementById("msg-search-input");
+    const msgSearchCount = document.getElementById("msg-search-count");
+    let searchMatches = [];
+    let searchIdx = -1;
+
+    function clearSearchHighlights() {
+      document.querySelectorAll(".msg-search-match, .msg-search-current").forEach(el => {
+        el.classList.remove("msg-search-match", "msg-search-current");
+      });
+    }
+
+    function runRoomSearch() {
+      clearSearchHighlights();
+      const q = msgSearchInput.value.trim().toLowerCase();
+      searchMatches = [];
+      searchIdx = -1;
+      if (!q) {
+        msgSearchCount.textContent = "0 / 0";
+        return;
+      }
+      roomMessages.forEach(m => {
+        if (m.deleted_for_all) return;
+        const hay = `${m.content || ""} ${m.file_name || ""} ${m.sender || ""}`.toLowerCase();
+        if (hay.includes(q)) {
+          const row = document.querySelector(`.msg-row[data-msg-id="${m.id}"]`);
+          if (row) {
+            row.classList.add("msg-search-match");
+            searchMatches.push(row);
+          }
+        }
+      });
+      if (searchMatches.length > 0) {
+        searchIdx = searchMatches.length - 1;
+        focusSearchMatch();
+      } else {
+        msgSearchCount.textContent = "0 / 0";
+      }
+    }
+
+    function focusSearchMatch() {
+      if (searchMatches.length === 0 || searchIdx < 0) return;
+      searchMatches.forEach(el => el.classList.remove("msg-search-current"));
+      const cur = searchMatches[searchIdx];
+      cur.classList.add("msg-search-current");
+      cur.scrollIntoView({ behavior: "smooth", block: "center" });
+      msgSearchCount.textContent = `${searchIdx + 1} / ${searchMatches.length}`;
+    }
+
+    function toggleRoomSearch(forceOpen = null) {
+      const open = forceOpen !== null ? forceOpen : !msgSearchBar.classList.contains("active");
+      msgSearchBar.classList.toggle("active", open);
+      if (open) {
+        msgSearchInput.focus();
+        runRoomSearch();
+      } else {
+        msgSearchInput.value = "";
+        clearSearchHighlights();
+        msgSearchCount.textContent = "0 / 0";
+      }
+    }
+
+    document.getElementById("msg-search-btn").onclick = () => toggleRoomSearch();
+    document.getElementById("msg-search-close").onclick = () => toggleRoomSearch(false);
+    msgSearchInput.addEventListener("input", runRoomSearch);
+    msgSearchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && searchMatches.length > 0) {
+        e.preventDefault();
+        searchIdx = (searchIdx - 1 + searchMatches.length) % searchMatches.length;
+        focusSearchMatch();
+      } else if (e.key === "Escape") {
+        toggleRoomSearch(false);
+      }
+    });
+    document.getElementById("msg-search-prev").onclick = () => {
+      if (searchMatches.length === 0) return;
+      searchIdx = (searchIdx - 1 + searchMatches.length) % searchMatches.length;
+      focusSearchMatch();
+    };
+    document.getElementById("msg-search-next").onclick = () => {
+      if (searchMatches.length === 0) return;
+      searchIdx = (searchIdx + 1) % searchMatches.length;
+      focusSearchMatch();
+    };
+    document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && appEl.style.display === "flex") {
+        e.preventDefault();
+        toggleRoomSearch(true);
+      }
+    });
+
+    // Shared Files / PDF & Media Vault
+    const vaultModal = document.getElementById("vault-modal");
+    const vaultListEl = document.getElementById("vault-list");
+    const vaultSearchInput = document.getElementById("vault-search-input");
+    let vaultTab = "all";
+
+    function getRoomAttachments() {
+      return roomMessages.filter(m => !m.deleted_for_all && m.file_url).slice().reverse();
+    }
+
+    function renderQuickFiles() {
+      const qf = document.getElementById("quick-files-list");
+      if (!qf) return;
+      const files = getRoomAttachments();
+      if (files.length === 0) {
+        qf.innerHTML = `<div class="notif-item" style="color:var(--muted);">No files shared in this room yet.</div>`;
+        return;
+      }
+      qf.innerHTML = "";
+      files.slice(0, 4).forEach(m => {
+        const fname = m.file_name || (m.msg_type === "audio" ? "Voice note" : "Attachment");
+        const isPdf = fname.toLowerCase().endsWith(".pdf");
+        const badge = isPdf ? "PDF" : (m.msg_type === "image" ? "IMG" : (m.msg_type === "audio" ? "MIC" : "DOC"));
+        const item = document.createElement("div");
+        item.className = "quick-person";
+        item.innerHTML = `
+          <div class="chat-item-left" style="min-width:0;flex:1;">
+            <div class="vault-thumb" style="width:32px;height:32px;font-size:0.7rem;">${badge}</div>
+            <div style="min-width:0;">
+              <div class="chat-name" style="font-size:0.82rem;">${escapeHtml(fname)}</div>
+              <div class="chat-sub" style="font-size:0.7rem;">by ${escapeHtml(m.sender)}</div>
+            </div>
+          </div>
+        `;
+        const actBtn = document.createElement("button");
+        actBtn.type = "button";
+        actBtn.className = "quick-chat-btn";
+        if (isPdf) {
+          actBtn.textContent = "View";
+          actBtn.onclick = () => openLazyPdf(m.room_id, m.file_url, fname);
+        } else {
+          actBtn.textContent = "Open";
+          actBtn.onclick = () => openVaultModal();
+        }
+        item.appendChild(actBtn);
+        qf.appendChild(item);
+      });
+    }
+
+    function renderVaultList() {
+      const q = vaultSearchInput.value.trim().toLowerCase();
+      const all = getRoomAttachments().filter(m => {
+        const fname = (m.file_name || (m.msg_type === "audio" ? "Voice note" : "Attachment")).toLowerCase();
+        if (q && !fname.includes(q) && !(m.sender || "").toLowerCase().includes(q)) return false;
+        if (vaultTab === "docs") return m.msg_type === "file";
+        if (vaultTab === "images") return m.msg_type === "image";
+        if (vaultTab === "audio") return m.msg_type === "audio";
+        return true;
+      });
+
+      if (all.length === 0) {
+        vaultListEl.innerHTML = `<div style="padding:28px;text-align:center;color:var(--muted);font-size:0.9rem;">No matching files or media found in this room.</div>`;
+        return;
+      }
+
+      vaultListEl.innerHTML = "";
+      all.forEach(m => {
+        const fname = m.file_name || (m.msg_type === "audio" ? "Voice note.webm" : "Attachment");
+        const isPdf = fname.toLowerCase().endsWith(".pdf");
+        const row = document.createElement("div");
+        row.className = "vault-item";
+
+        let thumbHtml = `<div class="vault-thumb">${isPdf ? "PDF" : (m.msg_type === "audio" ? "MIC" : "DOC")}</div>`;
+        if (m.msg_type === "image") {
+          thumbHtml = `<div class="vault-thumb"><img src="${m.file_url}" alt="${escapeHtml(fname)}" /></div>`;
+        }
+
+        let actionsHtml = "";
+        if (isPdf) {
+          actionsHtml += `<button type="button" class="primary-btn" style="padding:6px 12px;font-size:0.8rem;" onclick="openLazyPdf('${m.room_id}', '${m.file_url}', '${escapeHtml(fname)}')">View PDF</button>`;
+        } else if (m.msg_type === "image") {
+          actionsHtml += `<a class="icon-btn" href="${m.file_url}" target="_blank" style="text-decoration:none;">Open</a>`;
+        }
+        actionsHtml += `<button type="button" class="icon-btn" onclick="downloadLazyFile('${m.room_id}', '${m.file_url}', '${escapeHtml(fname)}')">Download</button>`;
+        actionsHtml += `<button type="button" class="icon-btn" onclick="jumpFromVault(${m.id})">Jump</button>`;
+
+        row.innerHTML = `
+          <div class="vault-item-left">
+            ${thumbHtml}
+            <div class="vault-meta">
+              <div class="vault-fname">${escapeHtml(fname)}</div>
+              <div class="vault-sub">Shared by ${escapeHtml(m.sender)} • ${escapeHtml((m.created_at || "").slice(0, 16))}</div>
+              ${m.msg_type === "audio" ? `<audio controls preload="metadata" src="${m.file_url}" style="height:30px;margin-top:4px;max-width:220px;"></audio>` : ""}
+            </div>
+          </div>
+          <div class="vault-actions">${actionsHtml}</div>
+        `;
+        vaultListEl.appendChild(row);
+      });
+    }
+
+    function openVaultModal() {
+      document.getElementById("vault-room-title").textContent = `Shared Files — ${activeRoom.name}`;
+      renderVaultList();
+      vaultModal.classList.add("active");
+    }
+
+    window.jumpFromVault = (msgId) => {
+      vaultModal.classList.remove("active");
+      scrollToMsg(msgId);
+    };
+
+    document.getElementById("vault-btn").onclick = openVaultModal;
+    document.getElementById("right-vault-btn").onclick = openVaultModal;
+    document.getElementById("vault-close-btn").onclick = () => vaultModal.classList.remove("active");
+    vaultSearchInput.addEventListener("input", renderVaultList);
+    document.querySelectorAll("#vault-tabs .vault-tab").forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll("#vault-tabs .vault-tab").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        vaultTab = btn.dataset.vtab || "all";
+        renderVaultList();
+      };
+    });
 
     const inviteModal = document.getElementById("invite-modal");
     const inviteUrlText = document.getElementById("invite-url-text");
@@ -2530,6 +3280,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
     }
 
     function notifyIncoming(msg) {
+      pushNotif(`${msg.sender} sent a message`);
       playChime();
       if (document.hidden && "Notification" in window && Notification.permission === "granted") {
         const preview = msg.content || (msg.msg_type === "audio" ? "Voice note" : msg.file_name || "Attachment");
