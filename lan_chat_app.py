@@ -448,7 +448,7 @@ async def pwa_icon() -> Response:
 
 @app.get("/sw.js")
 async def pwa_service_worker() -> Response:
-    sw_js = '''const CACHE_NAME = "lan-chat-shell-v11";
+    sw_js = '''const CACHE_NAME = "lan-chat-shell-v12";
 const MEDIA_CACHE = "lan-chat-media-v1";
 const SHELL_URLS = ["/", "/manifest.json", "/icon.svg"];
 
@@ -1293,10 +1293,15 @@ OFFLINE_HTML = """<!DOCTYPE html>
     .avatar-circle .status-dot.offline { background: #cbd5e1; }
     .top-action-row { display: flex; align-items: center; gap: 6px; }
     .pill-icon-btn {
-      padding: 6px 10px; border-radius: 999px; background: var(--panel-alt); color: var(--muted);
+      padding: 7px 10px; border-radius: 999px; background: var(--panel-alt); color: var(--muted);
       font-size: 0.78rem; font-weight: 600; transition: all 0.15s;
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
     }
     .pill-icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
+    .icon-btn svg, .pill-icon-btn svg, .call-min-top-btn svg, .danger-btn svg, .primary-btn svg {
+      width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2;
+      stroke-linecap: round; stroke-linejoin: round; display: block; flex-shrink: 0;
+    }
 
     .chats-title-row {
       padding: 16px 16px 8px; display: flex; align-items: center; justify-content: space-between;
@@ -1357,8 +1362,9 @@ OFFLINE_HTML = """<!DOCTYPE html>
     .chat-status { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
     .header-actions { display: flex; align-items: center; gap: 6px; position: relative; }
     .icon-btn {
-      padding: 7px 11px; border-radius: 999px; background: var(--panel-alt); color: var(--text);
-      font-size: 0.84rem; font-weight: 500; transition: background 0.15s;
+      padding: 8px; border-radius: 999px; background: var(--panel-alt); color: var(--text);
+      font-size: 0.84rem; font-weight: 500; transition: background 0.15s, color 0.15s;
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 36px; min-height: 36px;
     }
     .icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
     .icon-btn.recording { background: var(--error); color: #fff; font-weight: 600; }
@@ -1609,9 +1615,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
     }
     #call-modal.minimized .chat-title { color: #fff; font-size: 0.92rem; }
     #call-modal.minimized .chat-status { color: #cbd5e1; font-size: 0.74rem; }
-    #call-modal.minimized .call-min-top-btn {
-      position: static; background: var(--accent); color: #fff; padding: 4px 10px; font-size: 0.74rem;
-    }
+    #call-modal.minimized .call-min-top-btn { display: none; }
     #call-modal.minimized .call-videos { min-height: 110px; max-height: 130px; border-radius: 10px; }
     #call-modal.minimized #remote-video { max-height: 130px; }
     #call-modal.minimized #local-video { width: 58px; bottom: 6px; right: 6px; border-radius: 6px; }
@@ -1684,8 +1688,12 @@ OFFLINE_HTML = """<!DOCTYPE html>
           <span id="me-label"></span>
         </div>
         <div class="top-action-row">
-          <button class="pill-icon-btn" id="invite-btn" title="Share join URL & QR">Invite</button>
-          <button class="pill-icon-btn" id="logout-btn">Logout</button>
+          <button class="pill-icon-btn" id="invite-btn" title="Invite via Hotspot / Wi-Fi (QR)">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/></svg>
+          </button>
+          <button class="pill-icon-btn" id="logout-btn" title="Logout">
+            <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          </button>
         </div>
       </div>
 
@@ -1724,13 +1732,25 @@ OFFLINE_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <div class="header-actions">
-          <button type="button" class="icon-btn" id="msg-search-btn" title="Search messages in this chat (Ctrl+F)">Search</button>
-          <button type="button" class="icon-btn" id="vault-btn" title="Shared Files, PDFs & Media Vault">Files</button>
-          <button type="button" class="icon-btn" id="group-invite-btn" title="Invite others to this group">Invite</button>
-          <button type="button" class="icon-btn" id="voice-call-btn" style="display:none;" title="Voice call">Call</button>
-          <button type="button" class="icon-btn" id="video-call-btn" style="display:none;" title="Video call">Video</button>
-          <button type="button" class="icon-btn" id="clear-chat-btn">Clear</button>
-          <button type="button" class="icon-btn" id="sound-toggle-btn">Sound: On</button>
+          <button type="button" class="icon-btn" id="msg-search-btn" title="Search messages in this chat (Ctrl+F)">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="vault-btn" title="Shared Files, PDFs & Media Vault">
+            <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="group-invite-btn" title="Invite others to this group">
+            <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="voice-call-btn" style="display:none;" title="Voice call">
+            <svg viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="video-call-btn" style="display:none;" title="Video call">
+            <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="clear-chat-btn" title="Clear Chat">
+            <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="sound-toggle-btn" title="Sound: On"></button>
         </div>
       </div>
 
@@ -1769,10 +1789,16 @@ OFFLINE_HTML = """<!DOCTYPE html>
       <div class="composer-wrap">
         <form class="composer" id="composer">
           <input type="file" id="file-input" hidden />
-          <button type="button" class="icon-btn" id="attach-btn" title="Send file or image (max 50 MB)">Attach</button>
-          <button type="button" class="icon-btn" id="record-btn" title="Record voice note">Mic</button>
+          <button type="button" class="icon-btn" id="attach-btn" title="Attach file or image (max 50 MB)">
+            <svg viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="record-btn" title="Record voice note">
+            <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          </button>
           <input type="text" id="msg-input" placeholder="Type a message here..." autocomplete="off" />
-          <button type="submit" class="send-circle-btn" title="Send">➤</button>
+          <button type="submit" class="send-circle-btn" title="Send">
+            <svg viewBox="0 0 24 24" width="17" height="17" stroke="currentColor" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
         </form>
       </div>
     </main>
@@ -1807,7 +1833,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
           <div class="chat-title" id="vault-room-title">Shared Files & PDF Vault</div>
           <div class="chat-status" id="vault-room-sub">Decrypted locally in your browser</div>
         </div>
-        <button type="button" class="icon-btn" id="vault-close-btn">Close</button>
+        <button type="button" class="icon-btn" id="vault-close-btn" title="Close">✕</button>
       </div>
       <div class="vault-controls">
         <div class="vault-tabs" id="vault-tabs">
@@ -1829,8 +1855,8 @@ OFFLINE_HTML = """<!DOCTYPE html>
       <div class="invite-qr-box"><img id="invite-qr-img" alt="Join QR Code" /></div>
       <div class="invite-url" id="invite-url-text">Loading...</div>
       <div class="call-controls">
-        <button type="button" class="primary-btn" id="copy-invite-btn">Copy URL</button>
-        <button type="button" class="icon-btn" id="close-invite-btn">Close</button>
+        <button type="button" class="primary-btn" id="copy-invite-btn" title="Copy URL">Copy URL</button>
+        <button type="button" class="icon-btn" id="close-invite-btn" title="Close">✕</button>
       </div>
     </div>
   </div>
@@ -1839,9 +1865,13 @@ OFFLINE_HTML = """<!DOCTYPE html>
     <div class="pdf-toolbar">
       <div class="pdf-title" id="pdf-title">Document.pdf</div>
       <div class="header-actions">
-        <a class="icon-btn" id="pdf-download-link" href="#" download style="text-decoration:none;">Download</a>
-        <a class="icon-btn" id="pdf-newtab-link" href="#" target="_blank" style="text-decoration:none;">Open</a>
-        <button type="button" class="danger-btn" id="pdf-close-btn" style="padding:7px 12px;">Close</button>
+        <a class="icon-btn" id="pdf-download-link" href="#" download style="text-decoration:none;" title="Download PDF">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </a>
+        <a class="icon-btn" id="pdf-newtab-link" href="#" target="_blank" style="text-decoration:none;" title="Open in new tab">
+          <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        </a>
+        <button type="button" class="danger-btn" id="pdf-close-btn" style="padding:7px 11px;" title="Close">✕</button>
       </div>
     </div>
     <iframe id="pdf-frame" title="In-app PDF viewer"></iframe>
@@ -1849,7 +1879,9 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
   <div id="call-modal">
     <div class="call-card">
-      <button type="button" class="call-min-top-btn" id="call-min-toggle-btn" title="Minimize call to view chats">Hide / Chat</button>
+      <button type="button" class="call-min-top-btn" id="call-min-toggle-btn" title="Minimize / Expand call">
+        <svg viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+      </button>
       <div style="text-align:center;">
         <div class="chat-title" id="call-peer-name">Call</div>
         <div class="chat-status" id="call-status">Connecting...</div>
@@ -2194,7 +2226,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         ? (hasE2EE ? "Group chat • E2EE 🔒" : "Group chat")
         : (hasE2EE ? "Direct message • E2EE 🔒" : "Direct message");
       const clearBtn = document.getElementById("clear-chat-btn");
-      clearBtn.textContent = (room.isGroup && room.createdBy === me && room.id !== "group:general")
+      clearBtn.title = (room.isGroup && room.createdBy === me && room.id !== "group:general")
         ? "Delete Group"
         : "Clear Chat";
       const showCallBtns = !room.isGroup && Boolean(room.peer);
@@ -3264,8 +3296,23 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
     let soundEnabled = localStorage.getItem("lan_chat_sound") !== "off";
     const soundBtn = document.getElementById("sound-toggle-btn");
+    const SVG_ICONS = {
+      volOn: '<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>',
+      volOff: '<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>',
+      micOn: '<svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>',
+      micOff: '<svg viewBox="0 0 24 24"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>',
+      screenShare: '<svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><polyline points="9 10 12 7 15 10"/><line x1="12" y1="7" x2="12" y2="13"/></svg>',
+      screenStop: '<svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="9" y1="7" x2="15" y2="13"/><line x1="15" y1="7" x2="9" y2="13"/></svg>',
+      fullscreen: '<svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>',
+      minimize: '<svg viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+      expand: '<svg viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+      hangup: '<svg viewBox="0 0 24 24"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/><line x1="23" y1="1" x2="1" y2="23"/></svg>',
+      callAccept: '<svg viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>'
+    };
+
     function updateSoundBtn() {
-      soundBtn.textContent = soundEnabled ? "Sound: On" : "Muted";
+      soundBtn.innerHTML = soundEnabled ? SVG_ICONS.volOn : SVG_ICONS.volOff;
+      soundBtn.title = soundEnabled ? "Sound: On (click to mute)" : "Muted (click to unmute)";
     }
     updateSoundBtn();
     soundBtn.onclick = () => {
@@ -3339,10 +3386,10 @@ OFFLINE_HTML = """<!DOCTYPE html>
         mediaRecorder = new MediaRecorder(recStream);
         let seconds = 0;
         recordBtn.classList.add("recording");
-        recordBtn.textContent = "Stop 0s";
+        recordBtn.textContent = "⏹ 0s";
         recInterval = setInterval(() => {
           seconds += 1;
-          recordBtn.textContent = `Stop ${seconds}s`;
+          recordBtn.textContent = `⏹ ${seconds}s`;
         }, 1000);
 
         mediaRecorder.ondataavailable = (e) => {
@@ -3351,7 +3398,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         mediaRecorder.onstop = async () => {
           clearInterval(recInterval);
           recordBtn.classList.remove("recording");
-          recordBtn.textContent = "Mic";
+          recordBtn.innerHTML = SVG_ICONS.micOn;
           if (recStream) recStream.getTracks().forEach(t => t.stop());
 
           const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || "audio/webm" });
@@ -3471,13 +3518,17 @@ OFFLINE_HTML = """<!DOCTYPE html>
       pendingCandidates = [];
       micMuted = false;
       callModal.classList.remove("active", "minimized");
-      document.getElementById("call-min-toggle-btn").textContent = "Hide / Chat";
+      const topMinBtn = document.getElementById("call-min-toggle-btn");
+      topMinBtn.innerHTML = SVG_ICONS.minimize;
+      topMinBtn.title = "Minimize call to view chats";
     }
 
     function toggleCallMinimized(forceMin = null) {
       const nextMin = forceMin !== null ? forceMin : !callModal.classList.contains("minimized");
       callModal.classList.toggle("minimized", nextMin);
-      document.getElementById("call-min-toggle-btn").textContent = nextMin ? "Expand Call" : "Hide / Chat";
+      const topMinBtn = document.getElementById("call-min-toggle-btn");
+      topMinBtn.innerHTML = nextMin ? SVG_ICONS.expand : SVG_ICONS.minimize;
+      topMinBtn.title = nextMin ? "Expand Call" : "Minimize call to view chats";
       renderActiveCallControls();
     }
     document.getElementById("call-min-toggle-btn").onclick = () => toggleCallMinimized();
@@ -3549,10 +3600,13 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
     function renderActiveCallControls() {
       callControlsEl.innerHTML = "";
+      const isMin = callModal.classList.contains("minimized");
+
       const muteBtn = document.createElement("button");
       muteBtn.type = "button";
       muteBtn.className = "icon-btn";
-      muteBtn.textContent = micMuted ? "Unmute" : "Mute";
+      muteBtn.innerHTML = micMuted ? SVG_ICONS.micOff : SVG_ICONS.micOn;
+      muteBtn.title = micMuted ? "Unmute microphone" : "Mute microphone";
       muteBtn.onclick = () => {
         micMuted = !micMuted;
         if (callStream) callStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
@@ -3564,16 +3618,20 @@ OFFLINE_HTML = """<!DOCTYPE html>
         const screenBtn = document.createElement("button");
         screenBtn.type = "button";
         screenBtn.className = isSharingScreen ? "primary-btn" : "icon-btn";
-        screenBtn.textContent = isSharingScreen ? "Stop Sharing" : "Share Screen";
+        screenBtn.style.padding = "8px";
+        screenBtn.style.borderRadius = "999px";
+        screenBtn.innerHTML = isSharingScreen ? SVG_ICONS.screenStop : SVG_ICONS.screenShare;
+        screenBtn.title = isSharingScreen ? "Stop Sharing Screen" : "Share Screen";
         screenBtn.onclick = toggleScreenShare;
         callControlsEl.appendChild(screenBtn);
       }
 
-      if (callIsVideo && !callModal.classList.contains("minimized")) {
+      if (callIsVideo && !isMin) {
         const fsBtn = document.createElement("button");
         fsBtn.type = "button";
         fsBtn.className = "icon-btn";
-        fsBtn.textContent = "Fullscreen";
+        fsBtn.innerHTML = SVG_ICONS.fullscreen;
+        fsBtn.title = "Fullscreen";
         fsBtn.onclick = () => {
           if (remoteVideo.requestFullscreen) remoteVideo.requestFullscreen().catch(() => {});
           else if (callVideosEl.requestFullscreen) callVideosEl.requestFullscreen().catch(() => {});
@@ -3584,14 +3642,18 @@ OFFLINE_HTML = """<!DOCTYPE html>
       const minBtn = document.createElement("button");
       minBtn.type = "button";
       minBtn.className = "icon-btn";
-      minBtn.textContent = callModal.classList.contains("minimized") ? "Expand" : "Show Chat";
+      minBtn.innerHTML = isMin ? SVG_ICONS.expand : SVG_ICONS.minimize;
+      minBtn.title = isMin ? "Expand call" : "Hide call & show chat";
       minBtn.onclick = () => toggleCallMinimized();
       callControlsEl.appendChild(minBtn);
 
       const hangBtn = document.createElement("button");
       hangBtn.type = "button";
       hangBtn.className = "danger-btn";
-      hangBtn.textContent = "Hang Up";
+      hangBtn.style.padding = "8px 12px";
+      hangBtn.style.borderRadius = "999px";
+      hangBtn.innerHTML = SVG_ICONS.hangup;
+      hangBtn.title = "Hang Up";
       hangBtn.onclick = () => endCall(true);
       callControlsEl.appendChild(hangBtn);
     }
