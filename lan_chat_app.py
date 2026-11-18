@@ -406,7 +406,7 @@ def room_targets(room_id: str) -> list[str] | None:
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
-    return HTMLResponse(OFFLINE_HTML)
+    return HTMLResponse(OFFLINE_HTML, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 @app.get("/manifest.json")
@@ -448,7 +448,7 @@ async def pwa_icon() -> Response:
 
 @app.get("/sw.js")
 async def pwa_service_worker() -> Response:
-    sw_js = '''const CACHE_NAME = "lan-chat-shell-v6";
+    sw_js = '''const CACHE_NAME = "lan-chat-shell-v11";
 const MEDIA_CACHE = "lan-chat-media-v1";
 const SHELL_URLS = ["/", "/manifest.json", "/icon.svg"];
 
@@ -483,19 +483,25 @@ self.addEventListener("fetch", (event) => {
     );
     return;
   }
+  // Network-first for HTML shell so updates show immediately on LAN, with full offline fallback
   event.respondWith(
     caches.open(CACHE_NAME).then(async (cache) => {
-      const cached = await cache.match(event.request);
-      const netFetch = fetch(event.request).then((resp) => {
+      try {
+        const resp = await fetch(event.request, { cache: "no-store" });
         if (resp.ok) cache.put(event.request, resp.clone());
         return resp;
-      }).catch(() => cached);
-      return cached || netFetch;
+      } catch {
+        return (await cache.match(event.request)) || Response.error();
+      }
     })
   );
 });
 '''
-    return Response(content=sw_js, media_type="application/javascript")
+    return Response(
+        content=sw_js,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.get("/api/network-info")
@@ -1586,7 +1592,30 @@ OFFLINE_HTML = """<!DOCTYPE html>
       padding: 22px; width: 100%; max-width: 400px; display: flex; flex-direction: column;
       gap: 12px; align-items: center; text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.2);
     }
-    .call-card { max-width: 520px; }
+    .call-card { position: relative; max-width: 720px; }
+    .call-min-top-btn {
+      position: absolute; top: 14px; right: 14px; padding: 6px 12px; border-radius: 999px;
+      background: var(--panel-alt); color: var(--text); font-size: 0.78rem; font-weight: 600;
+    }
+    .call-min-top-btn:hover { background: var(--accent-soft); color: var(--accent); }
+    #call-modal.minimized {
+      inset: auto; top: 68px; right: 16px; width: auto; height: auto;
+      background: transparent; backdrop-filter: none; padding: 0; pointer-events: none;
+    }
+    #call-modal.minimized .call-card {
+      pointer-events: auto; width: 270px; max-width: 90vw; padding: 12px; gap: 8px;
+      border-radius: 16px; background: var(--dark-card); color: #fff;
+      border: 1px solid rgba(255,255,255,0.14); box-shadow: 0 14px 34px rgba(15, 23, 42, 0.38);
+    }
+    #call-modal.minimized .chat-title { color: #fff; font-size: 0.92rem; }
+    #call-modal.minimized .chat-status { color: #cbd5e1; font-size: 0.74rem; }
+    #call-modal.minimized .call-min-top-btn {
+      position: static; background: var(--accent); color: #fff; padding: 4px 10px; font-size: 0.74rem;
+    }
+    #call-modal.minimized .call-videos { min-height: 110px; max-height: 130px; border-radius: 10px; }
+    #call-modal.minimized #remote-video { max-height: 130px; }
+    #call-modal.minimized #local-video { width: 58px; bottom: 6px; right: 6px; border-radius: 6px; }
+    #call-modal.minimized .call-controls button { padding: 5px 10px; font-size: 0.75rem; }
     .invite-qr-box {
       background: #ffffff; padding: 10px; border-radius: 12px; border: 1px solid var(--border);
       width: 200px; height: 200px; display: flex; align-items: center; justify-content: center;
@@ -1597,10 +1626,10 @@ OFFLINE_HTML = """<!DOCTYPE html>
       font-family: monospace; font-size: 0.84rem; word-break: break-all; color: var(--accent);
     }
     .call-videos {
-      position: relative; width: 100%; background: #0f172a; border-radius: 14px; overflow: hidden; min-height: 220px;
+      position: relative; width: 100%; background: #0f172a; border-radius: 14px; overflow: hidden; min-height: 260px;
       display: flex; align-items: center; justify-content: center;
     }
-    #remote-video { width: 100%; max-height: 340px; object-fit: cover; }
+    #remote-video { width: 100%; max-height: 62vh; object-fit: contain; background: #0f172a; }
     #local-video {
       position: absolute; bottom: 10px; right: 10px; width: 120px; border-radius: 10px;
       border: 2px solid var(--accent); background: #111;
@@ -1820,6 +1849,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
   <div id="call-modal">
     <div class="call-card">
+      <button type="button" class="call-min-top-btn" id="call-min-toggle-btn" title="Minimize call to view chats">Hide / Chat</button>
       <div style="text-align:center;">
         <div class="chat-title" id="call-peer-name">Call</div>
         <div class="chat-status" id="call-status">Connecting...</div>
@@ -3351,8 +3381,10 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
     let pc = null;
     let callStream = null;
+    let screenStream = null;
     let callPeer = null;
     let callIsVideo = false;
+    let isSharingScreen = false;
     let pendingOffer = null;
     let pendingCandidates = [];
     let micMuted = false;
@@ -3379,8 +3411,57 @@ OFFLINE_HTML = """<!DOCTYPE html>
       }
     }
 
+    let mobileShareInterval = null;
+
+    function stopScreenShareTrackOnly() {
+      if (mobileShareInterval) {
+        clearInterval(mobileShareInterval);
+        mobileShareInterval = null;
+      }
+      if (screenStream) {
+        screenStream.getTracks().forEach(t => t.stop());
+        screenStream = null;
+      }
+      isSharingScreen = false;
+    }
+
+    function startMobileImageShareStream() {
+      return new Promise((resolve, reject) => {
+        const picker = document.createElement("input");
+        picker.type = "file";
+        picker.accept = "image/*";
+        picker.onchange = () => {
+          const file = picker.files && picker.files[0];
+          if (!file) { reject(new Error("No image selected")); return; }
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            const maxDim = 1280;
+            const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+            canvas.width = Math.max(320, Math.round((img.width || 640) * scale));
+            canvas.height = Math.max(240, Math.round((img.height || 480) * scale));
+            const ctx = canvas.getContext("2d");
+            const draw = () => {
+              ctx.fillStyle = "#0f172a";
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            };
+            draw();
+            mobileShareInterval = setInterval(draw, 250);
+            const stream = canvas.captureStream ? canvas.captureStream(15) : null;
+            if (!stream) { reject(new Error("Canvas stream not supported")); return; }
+            resolve(stream);
+          };
+          img.onerror = () => reject(new Error("Could not load image"));
+          img.src = URL.createObjectURL(file);
+        };
+        picker.click();
+      });
+    }
+
     function endCall(notifyPeer = true) {
       if (notifyPeer && callPeer) sendSignal(callPeer, "hangup");
+      stopScreenShareTrackOnly();
       if (pc) { pc.close(); pc = null; }
       if (callStream) { callStream.getTracks().forEach(t => t.stop()); callStream = null; }
       remoteVideo.srcObject = null;
@@ -3389,7 +3470,81 @@ OFFLINE_HTML = """<!DOCTYPE html>
       pendingOffer = null;
       pendingCandidates = [];
       micMuted = false;
-      callModal.classList.remove("active");
+      callModal.classList.remove("active", "minimized");
+      document.getElementById("call-min-toggle-btn").textContent = "Hide / Chat";
+    }
+
+    function toggleCallMinimized(forceMin = null) {
+      const nextMin = forceMin !== null ? forceMin : !callModal.classList.contains("minimized");
+      callModal.classList.toggle("minimized", nextMin);
+      document.getElementById("call-min-toggle-btn").textContent = nextMin ? "Expand Call" : "Hide / Chat";
+      renderActiveCallControls();
+    }
+    document.getElementById("call-min-toggle-btn").onclick = () => toggleCallMinimized();
+
+    async function toggleScreenShare() {
+      if (!pc || !callPeer) return;
+      if (isSharingScreen) {
+        stopScreenShareTrackOnly();
+        const camTrack = callStream ? callStream.getVideoTracks()[0] : null;
+        const vSender = pc.getSenders().find(s => s.track && s.track.kind === "video");
+        if (vSender && camTrack) {
+          await vSender.replaceTrack(camTrack);
+          localVideo.srcObject = callStream;
+        } else {
+          localVideo.srcObject = null;
+          sendSignal(callPeer, "screen_stopped");
+        }
+        renderActiveCallControls();
+        return;
+      }
+      try {
+        const displayFn = (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)
+          ? navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices)
+          : (navigator.getDisplayMedia ? navigator.getDisplayMedia.bind(navigator) : null);
+
+        if (displayFn) {
+          screenStream = await displayFn({ video: true, audio: false });
+        } else {
+          // Mobile browser fallback (Android Chrome / iOS Safari do not expose OS getDisplayMedia to web pages):
+          const useImage = confirm(
+            "Mobile browsers block full OS screen capture. " +
+            "Press OK to share a Screenshot / Image live on screen, or Cancel to switch to your Back Camera."
+          );
+          if (useImage) {
+            screenStream = await startMobileImageShareStream();
+          } else {
+            screenStream = await navigator.mediaDevices.getUserMedia({
+              video: { facingMode: { ideal: "environment" } },
+              audio: false,
+            });
+          }
+        }
+        const screenTrack = screenStream.getVideoTracks()[0];
+        if (!screenTrack) return;
+        isSharingScreen = true;
+        callIsVideo = true;
+        callVideosEl.style.display = "flex";
+        localVideo.srcObject = screenStream;
+
+        screenTrack.onended = () => {
+          if (isSharingScreen) toggleScreenShare();
+        };
+
+        const vSender = pc.getSenders().find(s => s.track && s.track.kind === "video");
+        if (vSender) {
+          await vSender.replaceTrack(screenTrack);
+        } else {
+          pc.addTrack(screenTrack, screenStream);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendSignal(callPeer, "renegotiate", offer, true);
+        }
+        renderActiveCallControls();
+      } catch (err) {
+        stopScreenShareTrackOnly();
+        renderActiveCallControls();
+      }
     }
 
     function renderActiveCallControls() {
@@ -3405,6 +3560,34 @@ OFFLINE_HTML = """<!DOCTYPE html>
       };
       callControlsEl.appendChild(muteBtn);
 
+      if (callIsVideo) {
+        const screenBtn = document.createElement("button");
+        screenBtn.type = "button";
+        screenBtn.className = isSharingScreen ? "primary-btn" : "icon-btn";
+        screenBtn.textContent = isSharingScreen ? "Stop Sharing" : "Share Screen";
+        screenBtn.onclick = toggleScreenShare;
+        callControlsEl.appendChild(screenBtn);
+      }
+
+      if (callIsVideo && !callModal.classList.contains("minimized")) {
+        const fsBtn = document.createElement("button");
+        fsBtn.type = "button";
+        fsBtn.className = "icon-btn";
+        fsBtn.textContent = "Fullscreen";
+        fsBtn.onclick = () => {
+          if (remoteVideo.requestFullscreen) remoteVideo.requestFullscreen().catch(() => {});
+          else if (callVideosEl.requestFullscreen) callVideosEl.requestFullscreen().catch(() => {});
+        };
+        callControlsEl.appendChild(fsBtn);
+      }
+
+      const minBtn = document.createElement("button");
+      minBtn.type = "button";
+      minBtn.className = "icon-btn";
+      minBtn.textContent = callModal.classList.contains("minimized") ? "Expand" : "Show Chat";
+      minBtn.onclick = () => toggleCallMinimized();
+      callControlsEl.appendChild(minBtn);
+
       const hangBtn = document.createElement("button");
       hangBtn.type = "button";
       hangBtn.className = "danger-btn";
@@ -3419,6 +3602,11 @@ OFFLINE_HTML = """<!DOCTYPE html>
         if (e.candidate) sendSignal(peer, "ice", e.candidate);
       };
       conn.ontrack = (e) => {
+        if (e.track.kind === "video") {
+          callIsVideo = true;
+          callVideosEl.style.display = "flex";
+          renderActiveCallControls();
+        }
         if (e.streams && e.streams[0]) {
           remoteVideo.srcObject = e.streams[0];
         } else {
@@ -3433,7 +3621,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         if (state === "checking") {
           callStatusEl.textContent = "ICE: checking network path...";
         } else if (state === "connected" || state === "completed") {
-          callStatusEl.textContent = "ICE: connected";
+          callStatusEl.textContent = isSharingScreen ? "Sharing screen • ICE: connected" : "ICE: connected";
         } else if (state === "failed") {
           callStatusEl.textContent = "ICE: failed (check Wi-Fi/hotspot firewall)";
         } else if (state === "disconnected") {
@@ -3470,7 +3658,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
 
         callPeerEl.textContent = callPeer;
         callStatusEl.textContent = isVideo ? "Calling (Video)..." : "Calling (Voice)...";
-        renderActiveCallControls();
+        toggleCallMinimized(false);
         callModal.classList.add("active");
       } catch (err) {
         alert("Could not start call: " + (err.message || err));
@@ -3487,9 +3675,14 @@ OFFLINE_HTML = """<!DOCTYPE html>
         return;
       }
       try {
-        callStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: callIsVideo });
+        try {
+          callStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: callIsVideo });
+        } catch {
+          // Fallback to audio-only if recipient has no webcam (e.g., viewing someone's shared screen on a desktop PC)
+          callStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        }
         callVideosEl.style.display = callIsVideo ? "flex" : "none";
-        localVideo.srcObject = callIsVideo ? callStream : null;
+        localVideo.srcObject = (callStream && callStream.getVideoTracks().length > 0) ? callStream : null;
 
         pc = createPeerConnection(callPeer);
         callStream.getTracks().forEach(t => pc.addTrack(t, callStream));
@@ -3519,7 +3712,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         callIsVideo = Boolean(video);
         pendingOffer = payload;
         callPeerEl.textContent = from;
-        callStatusEl.textContent = callIsVideo ? "Incoming Video Call..." : "Incoming Voice Call...";
+        callStatusEl.textContent = callIsVideo ? "Incoming Video / Screen Call..." : "Incoming Voice Call...";
         callVideosEl.style.display = callIsVideo ? "flex" : "none";
         callControlsEl.innerHTML = "";
 
@@ -3541,10 +3734,20 @@ OFFLINE_HTML = """<!DOCTYPE html>
         callControlsEl.appendChild(rejectBtn);
         callModal.classList.add("active");
         playChime();
+      } else if (signal_type === "renegotiate" && pc) {
+        callIsVideo = true;
+        callVideosEl.style.display = "flex";
+        await pc.setRemoteDescription(new RTCSessionDescription(payload));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendSignal(from, "answer", answer, true);
+        renderActiveCallControls();
+      } else if (signal_type === "screen_stopped") {
+        callStatusEl.textContent = "Screen sharing ended";
       } else if (signal_type === "answer" && pc) {
         await pc.setRemoteDescription(new RTCSessionDescription(payload));
         await flushPendingCandidates();
-        callStatusEl.textContent = "ICE: negotiating...";
+        callStatusEl.textContent = "ICE: connected";
       } else if (signal_type === "ice" && payload) {
         if (pc && pc.remoteDescription) {
           try { await pc.addIceCandidate(new RTCIceCandidate(payload)); } catch {}
@@ -3591,7 +3794,13 @@ OFFLINE_HTML = """<!DOCTYPE html>
         pullCircle.style.opacity = "1";
         pullCircle.style.transform = "translate(-50%, 16px) scale(1)";
         pullSvg.style.transform = "";
-        setTimeout(() => location.reload(), 180);
+        setTimeout(async () => {
+          if ("caches" in window) {
+            const keys = await caches.keys();
+            await Promise.all(keys.filter(k => k.startsWith("lan-chat-shell")).map(k => caches.delete(k)));
+          }
+          location.reload();
+        }, 180);
       } else {
         pullCircle.style.opacity = "0";
         pullCircle.style.transform = "translate(-50%, -48px) scale(0.8)";
@@ -3602,7 +3811,16 @@ OFFLINE_HTML = """<!DOCTYPE html>
     });
 
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
+      let refreshing = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (!refreshing) {
+          refreshing = true;
+          location.reload();
+        }
+      });
+      navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" })
+        .then(reg => reg.update().catch(() => {}))
+        .catch(() => {});
     }
 
     (async () => {
