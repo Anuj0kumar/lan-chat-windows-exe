@@ -16,6 +16,8 @@ import socket
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 import asyncio
 from contextlib import asynccontextmanager
@@ -59,6 +61,14 @@ async def lifespan(_app: FastAPI):
 
     loop.set_exception_handler(_ignore_win_reset)
     yield
+    # Force-close any open WebSockets on Ctrl+C / shutdown so terminal exits immediately
+    for uname, sockets in list(manager.active.items()):
+        for ws in list(sockets):
+            try:
+                await ws.close(code=1001)
+            except Exception:
+                pass
+            manager.disconnect(uname, ws)
 
 
 app = FastAPI(title="LAN Chat App", lifespan=lifespan)
@@ -177,6 +187,13 @@ def init_db() -> None:
                 wrapped_key TEXT NOT NULL,
                 PRIMARY KEY (room_id, username)
             );
+
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                message_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                option_idx INTEGER NOT NULL,
+                PRIMARY KEY (message_id, username)
+            );
             """
         )
         # Safe migrations for existing databases
@@ -209,6 +226,12 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN reply_sender TEXT")
         if "reply_preview" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN reply_preview TEXT")
+        if "pinned" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "thread_parent_id" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN thread_parent_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_poll_votes_msg ON poll_votes(message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread_parent ON messages(thread_parent_id)")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_sender_status ON messages(room_id, sender, status)")
@@ -283,6 +306,7 @@ def verify_token(token: str | None, request_ip: str) -> str:
 class ConnectionManager:
     def __init__(self) -> None:
         self.active: dict[str, set[WebSocket]] = {}
+        self.huddles: dict[str, set[str]] = {}
 
     async def connect(self, username: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -448,7 +472,7 @@ async def pwa_icon() -> Response:
 
 @app.get("/sw.js")
 async def pwa_service_worker() -> Response:
-    sw_js = '''const CACHE_NAME = "lan-chat-shell-v12";
+    sw_js = '''const CACHE_NAME = "lan-chat-shell-v17";
 const MEDIA_CACHE = "lan-chat-media-v1";
 const SHELL_URLS = ["/", "/manifest.json", "/icon.svg"];
 
@@ -769,7 +793,7 @@ async def get_messages(
         rows = conn.execute(
             f"""
             SELECT m.id, m.room_id, m.sender, m.content, m.msg_type, m.file_name, m.file_url,
-                   m.status, m.read_at, m.edited_at, m.deleted_for_all,
+                   m.status, m.read_at, m.edited_at, m.deleted_for_all, m.pinned, m.thread_parent_id,
                    m.reply_to_id, m.reply_sender, m.reply_preview, m.created_at
             FROM messages m
             WHERE m.room_id = ?
@@ -795,9 +819,424 @@ async def get_messages(
             rx_map: dict[int, dict[str, int]] = {}
             for rr in r_rows:
                 rx_map.setdefault(rr["message_id"], {})[rr["emoji"]] = rr["cnt"]
+            pv_rows = conn.execute(
+                f"SELECT message_id, option_idx, username FROM poll_votes WHERE message_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            pv_map: dict[int, dict[str, list[str]]] = {}
+            for pr in pv_rows:
+                pv_map.setdefault(pr["message_id"], {}).setdefault(str(pr["option_idx"]), []).append(pr["username"])
+            t_rows = conn.execute(
+                f"SELECT thread_parent_id, COUNT(*) AS cnt FROM messages WHERE thread_parent_id IN ({placeholders}) AND deleted_for_all = 0 GROUP BY thread_parent_id",
+                ids,
+            ).fetchall()
+            t_map = {tr["thread_parent_id"]: tr["cnt"] for tr in t_rows}
             for m in messages:
                 m["reactions"] = rx_map.get(m["id"], {})
+                m["poll_votes"] = pv_map.get(m["id"], {})
+                m["thread_count"] = t_map.get(m["id"], 0)
     return {"messages": messages}
+
+
+@app.get("/api/messages/{msg_id}/thread")
+async def get_thread_messages(
+    msg_id: int,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    username = verify_token(x_auth_token, get_client_ip(request))
+    with get_db() as conn:
+        parent = conn.execute("SELECT id, room_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent message not found.")
+        targets = room_targets(parent["room_id"])
+        if targets is not None and username not in targets:
+            raise HTTPException(status_code=403, detail="Access denied.")
+        rows = conn.execute(
+            """
+            SELECT id, room_id, sender, content, msg_type, file_name, file_url,
+                   status, read_at, edited_at, deleted_for_all, pinned, thread_parent_id,
+                   reply_to_id, reply_sender, reply_preview, created_at
+            FROM messages
+            WHERE thread_parent_id = ?
+            ORDER BY id ASC
+            """,
+            (msg_id,),
+        ).fetchall()
+    return {"replies": [dict(r) for r in rows]}
+
+
+class AIRequest(BaseModel):
+    room_id: str = "group:general"
+    mode: str = "summarize"
+    query: str = ""
+    messages: list[dict[str, Any]] = []
+
+
+TEXT_DOC_EXTENSIONS = {
+    ".txt", ".md", ".py", ".java", ".js", ".ts", ".c", ".cpp", ".h",
+    ".sql", ".json", ".csv", ".log", ".html", ".css", ".sh", ".bat", ".yaml", ".yml"
+}
+
+
+def _extract_room_files_context(room_id: str, max_chars: int = 10000) -> list[dict[str, str]]:
+    """Extract readable text from unencrypted text/code/PDF files shared in the room."""
+    docs: list[dict[str, str]] = []
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT file_name, file_url, sender, created_at
+            FROM messages
+            WHERE room_id = ? AND file_url IS NOT NULL AND deleted_for_all = 0
+            ORDER BY id DESC LIMIT 15
+            """,
+            (room_id,),
+        ).fetchall()
+    used = 0
+    for r in rows:
+        f_url = str(r["file_url"] or "")
+        f_name = str(r["file_name"] or "")
+        if not f_url.startswith("/uploads/") or f_url.endswith(".enc"):
+            continue
+        stored = os.path.basename(f_url[len("/uploads/"):])
+        fpath = UPLOAD_DIR / stored
+        if not fpath.is_file():
+            continue
+        ext = Path(f_name).suffix.lower()
+        snippet = ""
+        try:
+            if ext in TEXT_DOC_EXTENSIONS:
+                raw_bytes = fpath.read_bytes()[:24000]
+                snippet = raw_bytes.decode("utf-8", errors="ignore").strip()
+            elif ext == ".pdf":
+                raw_bytes = fpath.read_bytes()[:120000]
+                ascii_chunks = re.findall(rb"[\x20-\x7E]{5,}", raw_bytes)
+                snippet = " ".join(c.decode("latin-1", errors="ignore") for c in ascii_chunks[:250])
+        except Exception:
+            snippet = ""
+        if snippet:
+            budget = max(800, max_chars - used)
+            trimmed = snippet[:budget]
+            docs.append({
+                "file_name": f_name,
+                "sender": str(r["sender"] or ""),
+                "text": trimmed,
+            })
+            used += len(trimmed)
+            if used >= max_chars:
+                break
+    return docs
+
+
+def _query_local_llm(system_prompt: str, user_prompt: str) -> tuple[str | None, str]:
+    """Try querying local Ollama (11434) or llama.cpp / OpenAI-compatible server (8080)."""
+    ollama_url = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+    ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.2")
+    try:
+        payload = json.dumps({
+            "model": ollama_model,
+            "prompt": f"{system_prompt}\n\n{user_prompt}",
+            "stream": False,
+            "options": {"temperature": 0.25, "num_predict": 420},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            ollama_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=4.5) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            ans = str(body.get("response", "")).strip()
+            if ans:
+                return ans, f"Ollama ({ollama_model})"
+    except Exception:
+        pass
+
+    llama_cpp_url = os.environ.get("LLAMA_CPP_URL", "http://127.0.0.1:8080/v1/chat/completions")
+    try:
+        payload = json.dumps({
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.25,
+            "max_tokens": 420,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            llama_cpp_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=4.5) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            choices = body.get("choices") or []
+            if choices:
+                ans = str((choices[0].get("message") or {}).get("content", "")).strip()
+                if ans:
+                    return ans, "llama.cpp Local Server"
+    except Exception:
+        pass
+
+    return None, "Offline Extractive AI"
+
+
+def _offline_extractive_ai(
+    mode: str,
+    query: str,
+    messages: list[dict[str, Any]],
+    docs: list[dict[str, str]],
+) -> str:
+    """Zero-dependency deterministic extractive summarizer & TF-IDF/keyword RAG engine."""
+    clean_msgs: list[dict[str, str]] = []
+    for m in messages:
+        sender = str(m.get("sender") or "User").strip()
+        content = str(m.get("content") or "").strip()
+        fname = str(m.get("file_name") or "").strip()
+        ts = str(m.get("created_at") or "")[-8:-3]
+        if not content and fname:
+            content = f"[Shared file: {fname}]"
+        if content and not content.startswith("E2EE:"):
+            clean_msgs.append({"sender": sender, "content": content, "file_name": fname, "ts": ts})
+
+    if mode == "summarize":
+        if not clean_msgs and not docs:
+            return "No readable messages or files in this room yet to summarize."
+        participants: dict[str, int] = {}
+        files_shared: list[str] = []
+        action_items: list[str] = []
+        scored: list[tuple[float, int, dict[str, str]]] = []
+
+        stopwords = {
+            "the", "and", "for", "that", "this", "with", "from", "have", "are", "was",
+            "were", "will", "can", "not", "but", "you", "your", "hai", "aur", "mein",
+            "kar", "kya", "nhi", "nahi", "bhi", "isko", "usko", "ek", "to", "in", "on", "of"
+        }
+        word_freq: dict[str, int] = {}
+        for m in clean_msgs:
+            participants[m["sender"]] = participants.get(m["sender"], 0) + 1
+            if m["file_name"]:
+                files_shared.append(f"`{m['file_name']}` (by {m['sender']})")
+            words = re.findall(r"[a-zA-Z0-9_]{3,}", m["content"].lower())
+            for w in words:
+                if w not in stopwords:
+                    word_freq[w] = word_freq.get(w, 0) + 1
+            low = m["content"].lower()
+            if any(k in low for k in ("todo", "fix", "deploy", "need to", "deadline", "kal", "karna", "check", "update", "bug", "action", "?")):
+                if len(m["content"]) > 6:
+                    action_items.append(f"- **{m['sender']}**: {m['content'][:160]}")
+
+        for idx, m in enumerate(clean_msgs):
+            words = [w for w in re.findall(r"[a-zA-Z0-9_]{3,}", m["content"].lower()) if w not in stopwords]
+            score = sum(word_freq.get(w, 0) for w in set(words)) / (len(words) ** 0.5 + 1.0)
+            if "?" in m["content"] or "```" in m["content"]:
+                score += 2.0
+            scored.append((score, idx, m))
+
+        top_picks = sorted(scored, key=lambda x: x[0], reverse=True)[:5]
+        top_chronological = [item[2] for item in sorted(top_picks, key=lambda x: x[1])]
+
+        part_str = ", ".join(f"**{u}** ({c})" for u, c in sorted(participants.items(), key=lambda x: -x[1]))
+        lines = [
+            f"### 🧠 Room Summary ({len(clean_msgs)} messages analyzed)",
+            f"- **Active Participants**: {part_str or 'None'}",
+        ]
+        if files_shared:
+            lines.append(f"- **Shared Files ({len(files_shared)})**: " + ", ".join(files_shared[:6]))
+        if top_chronological:
+            lines.append("\n**Key Discussion Highlights:**")
+            for m in top_chronological:
+                preview = m["content"].replace("\n", " ")
+                if len(preview) > 180:
+                    preview = preview[:177] + "..."
+                ts_prefix = f"[{m['ts']}] " if m["ts"] else ""
+                lines.append(f"- {ts_prefix}**{m['sender']}**: {preview}")
+        if action_items:
+            lines.append("\n**Questions & Action Items Detected:**")
+            for act in action_items[-4:]:
+                lines.append(act)
+        return "\n".join(lines)
+
+    # mode == "ask" (RAG over messages + shared room files)
+    q_clean = query.strip()
+    if not q_clean:
+        return "Please provide a question after `/ask`, e.g. `/ask what port or deadline was discussed?`"
+
+    q_tokens = [w for w in re.findall(r"[a-zA-Z0-9_]{2,}", q_clean.lower())]
+    hits: list[tuple[float, str]] = []
+
+    for m in clean_msgs:
+        text_low = m["content"].lower()
+        overlap = sum(2.5 if tok in text_low else 0.0 for tok in q_tokens)
+        if q_clean.lower() in text_low:
+            overlap += 5.0
+        if overlap > 0:
+            ts_prefix = f"[{m['ts']}] " if m["ts"] else ""
+            hits.append((overlap, f"- 💬 {ts_prefix}**{m['sender']}**: {m['content'][:240]}"))
+
+    for d in docs:
+        chunks = [c.strip() for c in re.split(r"[\n\.]+", d["text"]) if len(c.strip()) > 15]
+        for ch in chunks:
+            ch_low = ch.lower()
+            overlap = sum(2.5 if tok in ch_low else 0.0 for tok in q_tokens)
+            if q_clean.lower() in ch_low:
+                overlap += 6.0
+            if overlap > 0:
+                hits.append((overlap + 0.5, f"- 📄 **`{d['file_name']}`** ({d['sender']}): {ch[:240]}"))
+
+    if not hits:
+        recent_fallback = [f"- **{m['sender']}**: {m['content'][:160]}" for m in clean_msgs[-4:]]
+        return (
+            f"### 🔎 Answer for: *{q_clean}*\n"
+            f"No exact keyword match found in {len(clean_msgs)} messages and {len(docs)} readable files.\n"
+            + ("\n**Most Recent Context in Room:**\n" + "\n".join(recent_fallback) if recent_fallback else "")
+        )
+
+    top_hits = [h[1] for h in sorted(hits, key=lambda x: x[0], reverse=True)[:6]]
+    return (
+        f"### 🔎 RAG Answer for: *{q_clean}*\n"
+        f"Found **{len(hits)}** relevant match(es) across room messages & shared files:\n"
+        + "\n".join(top_hits)
+    )
+
+
+@app.post("/api/ai")
+async def run_local_ai(
+    payload: AIRequest,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_token(x_auth_token, get_client_ip(request))
+    mode = payload.mode.lower().strip()
+    if mode not in ("summarize", "ask"):
+        mode = "summarize"
+
+    def _execute_ai() -> dict[str, Any]:
+        docs = _extract_room_files_context(payload.room_id)
+        msg_lines = []
+        for m in payload.messages[-60:]:
+            s = str(m.get("sender") or "User")
+            c = str(m.get("content") or "").strip()
+            fn = str(m.get("file_name") or "").strip()
+            if not c and fn:
+                c = f"[Shared file: {fn}]"
+            if c and not c.startswith("E2EE:"):
+                msg_lines.append(f"{s}: {c}")
+        doc_lines = [f"[File {d['file_name']} by {d['sender']}]:\n{d['text'][:2000]}" for d in docs]
+        combined_context = "\n".join(msg_lines)
+        if doc_lines:
+            combined_context += "\n\n--- SHARED FILES ---\n" + "\n\n".join(doc_lines)
+
+        if mode == "summarize":
+            sys_prompt = "You are a concise offline LAN Chat AI assistant. Summarize the chat conversation and key action items in clean Markdown bullets."
+            usr_prompt = f"Summarize this chat transcript:\n\n{combined_context[:12000]}"
+        else:
+            sys_prompt = "You are a concise offline LAN Chat RAG assistant. Answer the user's question directly using only the provided chat transcript and shared file excerpts."
+            usr_prompt = f"Question: {payload.query}\n\nContext:\n{combined_context[:12000]}"
+
+        llm_ans, engine = _query_local_llm(sys_prompt, usr_prompt)
+        if llm_ans:
+            return {"answer": llm_ans, "engine": engine, "files_indexed": len(docs)}
+        fallback_ans = _offline_extractive_ai(mode, payload.query, payload.messages, docs)
+        return {"answer": fallback_ans, "engine": engine, "files_indexed": len(docs)}
+
+    return await run_db(_execute_ai)
+
+
+@app.post("/api/webhooks/{room_id}")
+async def incoming_webhook(
+    room_id: str,
+    request: Request,
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Receive automated alerts from local Gitea, GitLab, Jenkins, or LAN scripts."""
+    clean_room = room_id.strip() or "group:general"
+    if not clean_room.startswith("group:") and not clean_room.startswith("dm:"):
+        clean_room = f"group:{clean_room}"
+
+    expected_secret = os.environ.get("LAN_CHAT_WEBHOOK_SECRET", "").strip()
+    try:
+        body = await request.json()
+    except Exception:
+        raw_body = (await request.body()).decode("utf-8", errors="ignore").strip()
+        body = {"text": raw_body} if raw_body else {}
+
+    provided_secret = x_webhook_secret or str(body.get("secret", "")).strip()
+    if expected_secret and not hmac.compare_digest(provided_secret, expected_secret):
+        raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
+    sender_raw = str(body.get("sender") or body.get("username") or body.get("bot") or "WebhookBot").strip()
+    sender_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", sender_raw)[:24] or "WebhookBot"
+
+    # Format Gitea / GitLab / GitHub push payloads automatically if `commits` is present
+    text = str(body.get("text") or body.get("message") or body.get("content") or "").strip()
+    if not text and isinstance(body.get("commits"), list):
+        repo_name = str((body.get("repository") or {}).get("name") or "repo")
+        pusher = str((body.get("pusher") or {}).get("name") or body.get("user_name") or sender_clean)
+        ref = str(body.get("ref") or "main").split("/")[-1]
+        commits = body.get("commits") or []
+        commit_bullets = []
+        for c in commits[:5]:
+            cid = str(c.get("id") or "")[:7]
+            cmsg = str(c.get("message") or "").splitlines()[0][:100]
+            commit_bullets.append(f"- `{cid}` {cmsg}")
+        text = f"🚀 **[{repo_name}:{ref}]** {len(commits)} commit(s) pushed by **{pusher}**:\n" + "\n".join(commit_bullets)
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Webhook payload must include 'text' or 'commits'.")
+
+    created_at = utc_now_iso()
+    def _insert_webhook_msg() -> int:
+        with get_db() as conn:
+            if clean_room.startswith("group:"):
+                r_title = clean_room.split(":", 1)[1].replace("-", " ").title()
+                conn.execute(
+                    "INSERT OR IGNORE INTO rooms (id, name, is_group, created_by, created_at) VALUES (?, ?, 1, ?, ?)",
+                    (clean_room, r_title, sender_clean, created_at),
+                )
+            cur = conn.execute(
+                """
+                INSERT INTO messages (room_id, sender, content, msg_type, status, created_at)
+                VALUES (?, ?, ?, 'text', 'delivered', ?)
+                """,
+                (clean_room, f"🤖 {sender_clean}", text, created_at),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    msg_id = await run_db(_insert_webhook_msg)
+    event_payload = {
+        "type": "message",
+        "message": {
+            "id": msg_id,
+            "room_id": clean_room,
+            "sender": f"🤖 {sender_clean}",
+            "content": text,
+            "msg_type": "text",
+            "file_name": None,
+            "file_url": None,
+            "status": "delivered",
+            "reply_to_id": None,
+            "reply_sender": None,
+            "reply_preview": None,
+            "thread_parent_id": None,
+            "parent_thread_count": 0,
+            "thread_count": 0,
+            "pinned": 0,
+            "reactions": {},
+            "poll_votes": {},
+            "created_at": created_at,
+        },
+    }
+    targets = room_targets(clean_room)
+    if targets is None:
+        await manager.broadcast_all(event_payload)
+    else:
+        for t in targets:
+            await manager.send_to_user(t, event_payload)
+
+    return {"ok": True, "id": msg_id, "room_id": clean_room}
 
 
 @app.post("/api/upload")
@@ -887,6 +1326,7 @@ async def websocket_endpoint(
         return
 
     await manager.connect(clean_user, websocket)
+    print(f"[WS] + {clean_user} connected ({ip})")
     last_typing_sent: dict[str, float] = {}
     try:
         while True:
@@ -915,6 +1355,41 @@ async def websocket_endpoint(
                         "payload": data.get("payload"),
                     },
                 )
+
+            elif event_type == "huddle_signal":
+                room_id = str(data.get("room_id", "group:general")).strip()
+                action = str(data.get("action", "")).strip()
+                if not room_id or not action:
+                    continue
+                members = manager.huddles.setdefault(room_id, set())
+                if action == "join":
+                    existing_peers = [u for u in members if u != clean_user and u in manager.active]
+                    members.add(clean_user)
+                    await manager.send_to_user(
+                        clean_user,
+                        {"type": "huddle_peers", "room_id": room_id, "peers": existing_peers},
+                    )
+                    await manager.broadcast_all(
+                        {"type": "huddle_joined", "room_id": room_id, "username": clean_user, "count": len(members)}
+                    )
+                elif action == "leave":
+                    members.discard(clean_user)
+                    await manager.broadcast_all(
+                        {"type": "huddle_left", "room_id": room_id, "username": clean_user, "count": len(members)}
+                    )
+                elif action in ("offer", "answer", "ice"):
+                    target = str(data.get("target", "")).strip()
+                    if target:
+                        await manager.send_to_user(
+                            target,
+                            {
+                                "type": "huddle_signal",
+                                "room_id": room_id,
+                                "from": clean_user,
+                                "action": action,
+                                "payload": data.get("payload"),
+                            },
+                        )
 
             elif event_type == "typing":
                 room_id = data.get("room_id", "group:general")
@@ -1107,6 +1582,77 @@ async def websocket_endpoint(
                     for target in targets:
                         await manager.send_to_user(target, ev)
 
+            elif event_type == "pin_message":
+                msg_id = int(data.get("id", 0))
+                if not msg_id:
+                    continue
+                with get_db() as conn:
+                    row = conn.execute(
+                        "SELECT id, room_id, pinned, deleted_for_all FROM messages WHERE id = ?",
+                        (msg_id,),
+                    ).fetchone()
+                    if not row or row["deleted_for_all"]:
+                        continue
+                    targets = room_targets(row["room_id"])
+                    if targets is not None and clean_user not in targets:
+                        continue
+                    next_pin = 0 if row["pinned"] else 1
+                    if "pinned" in data:
+                        next_pin = 1 if data.get("pinned") else 0
+                    conn.execute("UPDATE messages SET pinned = ? WHERE id = ?", (next_pin, msg_id))
+                    conn.commit()
+                ev = {"type": "message_pinned", "room_id": row["room_id"], "id": msg_id, "pinned": next_pin}
+                if targets is None:
+                    await manager.broadcast_all(ev)
+                else:
+                    for target in targets:
+                        await manager.send_to_user(target, ev)
+
+            elif event_type == "vote_poll":
+                msg_id = int(data.get("id", 0))
+                option_idx = int(data.get("option_idx", -1))
+                if not msg_id or option_idx < 0 or option_idx > 10:
+                    continue
+                with get_db() as conn:
+                    row = conn.execute(
+                        "SELECT id, room_id, msg_type, deleted_for_all FROM messages WHERE id = ?",
+                        (msg_id,),
+                    ).fetchone()
+                    if not row or row["deleted_for_all"] or row["msg_type"] != "poll":
+                        continue
+                    targets = room_targets(row["room_id"])
+                    if targets is not None and clean_user not in targets:
+                        continue
+                    existing_vote = conn.execute(
+                        "SELECT option_idx FROM poll_votes WHERE message_id = ? AND username = ?",
+                        (msg_id, clean_user),
+                    ).fetchone()
+                    if existing_vote and int(existing_vote["option_idx"]) == option_idx:
+                        conn.execute(
+                            "DELETE FROM poll_votes WHERE message_id = ? AND username = ?",
+                            (msg_id, clean_user),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO poll_votes (message_id, username, option_idx) VALUES (?, ?, ?)",
+                            (msg_id, clean_user, option_idx),
+                        )
+                    conn.commit()
+                    pv_rows = conn.execute(
+                        "SELECT option_idx, username FROM poll_votes WHERE message_id = ?",
+                        (msg_id,),
+                    ).fetchall()
+                    poll_votes: dict[str, list[str]] = {}
+                    for pr in pv_rows:
+                        poll_votes.setdefault(str(pr["option_idx"]), []).append(pr["username"])
+
+                ev = {"type": "poll_updated", "room_id": row["room_id"], "id": msg_id, "poll_votes": poll_votes}
+                if targets is None:
+                    await manager.broadcast_all(ev)
+                else:
+                    for target in targets:
+                        await manager.send_to_user(target, ev)
+
             elif event_type == "message":
                 room_id = data.get("room_id", "group:general")
                 peer = data.get("peer")
@@ -1124,6 +1670,7 @@ async def websocket_endpoint(
                 reply_to_id = data.get("reply_to_id")
                 reply_sender = data.get("reply_sender")
                 reply_preview = data.get("reply_preview")
+                thread_parent_id = data.get("thread_parent_id")
                 if not content and not file_url:
                     continue
 
@@ -1134,25 +1681,32 @@ async def websocket_endpoint(
                 initial_status = "delivered" if other_online else "sent"
 
                 created_at = utc_now_iso()
-                def _do_insert_msg() -> int:
+                def _do_insert_msg() -> tuple[int, int]:
                     with get_db() as conn:
                         cur = conn.execute(
                             """
                             INSERT INTO messages (
                                 room_id, sender, content, msg_type, file_name, file_url,
-                                status, reply_to_id, reply_sender, reply_preview, created_at
+                                status, reply_to_id, reply_sender, reply_preview, thread_parent_id, created_at
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 room_id, clean_user, content, msg_type, file_name, file_url,
-                                initial_status, reply_to_id, reply_sender, reply_preview, created_at,
+                                initial_status, reply_to_id, reply_sender, reply_preview, thread_parent_id, created_at,
                             ),
                         )
+                        t_cnt = 0
+                        if thread_parent_id:
+                            t_row = conn.execute(
+                                "SELECT COUNT(*) AS cnt FROM messages WHERE thread_parent_id = ? AND deleted_for_all = 0",
+                                (thread_parent_id,),
+                            ).fetchone()
+                            t_cnt = int(t_row["cnt"]) if t_row else 1
                         conn.commit()
-                        return int(cur.lastrowid)
+                        return int(cur.lastrowid), t_cnt
 
-                msg_id = await run_db(_do_insert_msg)
+                msg_id, parent_thread_count = await run_db(_do_insert_msg)
 
                 payload = {
                     "type": "message",
@@ -1168,7 +1722,12 @@ async def websocket_endpoint(
                         "reply_to_id": reply_to_id,
                         "reply_sender": reply_sender,
                         "reply_preview": reply_preview,
+                        "thread_parent_id": thread_parent_id,
+                        "parent_thread_count": parent_thread_count,
+                        "thread_count": 0,
+                        "pinned": 0,
                         "reactions": {},
+                        "poll_votes": {},
                         "created_at": created_at,
                     },
                 }
@@ -1178,9 +1737,25 @@ async def websocket_endpoint(
                 else:
                     for target in targets:
                         await manager.send_to_user(target, payload)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError, Exception):
+        pass
+    finally:
         manager.disconnect(clean_user, websocket)
-        await manager.broadcast_presence()
+        print(f"[WS] - {clean_user} disconnected ({ip})")
+        if clean_user not in manager.active:
+            for r_id, members in list(manager.huddles.items()):
+                if clean_user in members:
+                    members.discard(clean_user)
+                    try:
+                        await manager.broadcast_all(
+                            {"type": "huddle_left", "room_id": r_id, "username": clean_user, "count": len(members)}
+                        )
+                    except Exception:
+                        pass
+        try:
+            await manager.broadcast_presence()
+        except Exception:
+            pass
 
 
 def get_all_lan_ips() -> list[str]:
@@ -1211,7 +1786,7 @@ def get_lan_ip() -> str:
     return get_all_lan_ips()[0]
 
 
-OFFLINE_HTML = """<!DOCTYPE html>
+OFFLINE_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1490,9 +2065,64 @@ OFFLINE_HTML = """<!DOCTYPE html>
       background: var(--panel-alt); border: 1px solid var(--border); border-radius: 999px;
       padding: 5px 6px 5px 10px;
     }
-    .composer input[type="text"] {
+    .composer input[type="text"], .composer textarea {
       flex: 1 1 0%; width: 0; min-width: 0; padding: 8px 6px; border: none;
       background: transparent; color: var(--text); font-size: 0.95rem; outline: none;
+      resize: none; max-height: 110px; line-height: 1.35;
+    }
+    /* Markdown & Syntax-Highlighted Code Blocks */
+    .inline-code {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.84em;
+      padding: 2px 5px; border-radius: 5px; background: rgba(15, 23, 42, 0.1);
+    }
+    .bubble.me .inline-code { background: rgba(255, 255, 255, 0.22); }
+    .code-block-wrap {
+      margin: 6px 0; border-radius: 10px; overflow: hidden; background: #0f172a; color: #e2e8f0;
+      border: 1px solid rgba(255, 255, 255, 0.12); font-size: 0.82rem; min-width: 220px;
+    }
+    .code-block-hdr {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 5px 10px; background: #1e293b; color: #94a3b8; font-size: 0.72rem; font-family: monospace;
+    }
+    .copy-code-btn {
+      background: rgba(255, 255, 255, 0.1); color: #e2e8f0; padding: 2px 8px; border-radius: 6px;
+      font-size: 0.7rem; font-weight: 600;
+    }
+    .copy-code-btn:hover { background: var(--accent); color: #fff; }
+    .code-block-pre {
+      padding: 10px 12px; overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      line-height: 1.45; white-space: pre; margin: 0;
+    }
+    .tok-kw { color: #c084fc; font-weight: 600; }
+    .tok-bi { color: #38bdf8; }
+    .tok-dec { color: #fbbf24; }
+    .tok-str { color: #86efac; }
+    .tok-num { color: #fca5a5; }
+    .tok-cmt { color: #64748b; font-style: italic; }
+
+    /* Slack-style Thread Chip & Side Thread Drawer */
+    .thread-chip {
+      margin-top: 4px; padding: 3px 10px; border-radius: 999px; background: var(--accent-soft);
+      color: var(--accent); font-size: 0.74rem; font-weight: 600; display: inline-flex;
+      align-items: center; gap: 5px;
+    }
+    .thread-chip:hover { background: var(--accent); color: #fff; }
+    #thread-drawer {
+      display: none; position: fixed; top: 0; right: 0; bottom: 0; width: 360px; max-width: 100vw;
+      z-index: 62; background: var(--panel); border-left: 1px solid var(--border);
+      box-shadow: -12px 0 36px rgba(15, 23, 42, 0.14); flex-direction: column;
+    }
+    #thread-drawer.active { display: flex; }
+    .thread-hdr {
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .thread-parent-box {
+      padding: 12px 16px; background: var(--panel-alt); border-bottom: 1px solid var(--border);
+      font-size: 0.86rem;
+    }
+    .thread-list {
+      flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
     }
     .composer button { flex-shrink: 0; }
     .send-circle-btn {
@@ -1524,6 +2154,61 @@ OFFLINE_HTML = """<!DOCTYPE html>
       background: var(--accent); color: #fff; font-size: 0.75rem; font-weight: 600;
       padding: 5px 12px; border-radius: 999px;
     }
+
+    /* Pinned Message Top Banner */
+    #pinned-banner {
+      display: none; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 7px 16px; background: var(--accent-soft); border-bottom: 1px solid var(--border);
+      cursor: pointer; font-size: 0.82rem;
+    }
+    #pinned-banner.active { display: flex; }
+    .pinned-banner-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+    .pinned-badge {
+      background: var(--accent); color: #fff; font-weight: 700; font-size: 0.7rem;
+      padding: 2px 7px; border-radius: 999px; flex-shrink: 0;
+    }
+    .pinned-text { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Live Poll Card inside Chat Bubble */
+    .poll-box {
+      min-width: 230px; max-width: 320px; display: flex; flex-direction: column; gap: 7px; margin-top: 2px;
+    }
+    .poll-q { font-weight: 700; font-size: 0.94rem; margin-bottom: 2px; }
+    .poll-opt {
+      position: relative; overflow: hidden; border-radius: 10px; padding: 8px 10px;
+      border: 1px solid rgba(15, 23, 42, 0.14); background: rgba(255, 255, 255, 0.55);
+      color: var(--text); text-align: left; display: flex; flex-direction: column; gap: 3px;
+      transition: transform 0.1s;
+    }
+    .bubble.me .poll-opt {
+      border-color: rgba(255, 255, 255, 0.28); background: rgba(15, 23, 42, 0.22); color: #fff;
+    }
+    .poll-opt.voted { border-color: var(--accent); font-weight: 600; }
+    .bubble.me .poll-opt.voted { border-color: #fff; background: rgba(255, 255, 255, 0.26); }
+    .poll-opt-top { display: flex; justify-content: space-between; gap: 8px; font-size: 0.84rem; position: relative; z-index: 1; }
+    .poll-bar-track { width: 100%; height: 5px; border-radius: 999px; background: rgba(15, 23, 42, 0.1); overflow: hidden; }
+    .bubble.me .poll-bar-track { background: rgba(255, 255, 255, 0.22); }
+    .poll-bar-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.2s ease; }
+    .bubble.me .poll-bar-fill { background: #fff; }
+    .poll-footer { font-size: 0.72rem; opacity: 0.82; margin-top: 2px; }
+
+    /* Create Poll Modal */
+    #poll-modal {
+      display: none; position: fixed; inset: 0; z-index: 67;
+      background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px);
+      align-items: center; justify-content: center; padding: 16px;
+    }
+    #poll-modal.active { display: flex; }
+    .poll-modal-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 18px;
+      padding: 20px; width: 100%; max-width: 420px; display: flex; flex-direction: column;
+      gap: 10px; box-shadow: 0 20px 50px rgba(0,0,0,0.22);
+    }
+    .poll-modal-card input {
+      width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--panel-alt); color: var(--text); font-size: 0.9rem; outline: none;
+    }
+    .poll-modal-card input:focus { border-color: var(--accent); background: #fff; }
 
     /* In-Room Message Search Bar */
     #msg-search-bar {
@@ -1633,6 +2318,22 @@ OFFLINE_HTML = """<!DOCTYPE html>
       position: relative; width: 100%; background: #0f172a; border-radius: 14px; overflow: hidden; min-height: 260px;
       display: flex; align-items: center; justify-content: center;
     }
+    #huddle-grid {
+      display: none; width: 100%; gap: 8px; padding: 10px; background: #0f172a; border-radius: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); max-height: 56vh; overflow-y: auto;
+    }
+    #huddle-grid.active { display: grid; }
+    .huddle-tile {
+      position: relative; background: #1e293b; border-radius: 10px; overflow: hidden; min-height: 120px;
+      display: flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.12);
+    }
+    .huddle-tile video { width: 100%; height: 100%; max-height: 180px; object-fit: cover; }
+    .huddle-tile-label {
+      position: absolute; bottom: 6px; left: 8px; background: rgba(15, 23, 42, 0.75); color: #fff;
+      font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+    }
+    .icon-btn.ptt-active { background: var(--online); color: #fff; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.25); }
+    .icon-btn.rec-active { background: var(--error); color: #fff; }
     #remote-video { width: 100%; max-height: 62vh; object-fit: contain; background: #0f172a; }
     #local-video {
       position: absolute; bottom: 10px; right: 10px; width: 120px; border-radius: 10px;
@@ -1762,6 +2463,14 @@ OFFLINE_HTML = """<!DOCTYPE html>
         <button type="button" class="icon-btn" id="msg-search-close" title="Close search">×</button>
       </div>
 
+      <div id="pinned-banner">
+        <div class="pinned-banner-left" id="pinned-banner-jump" title="Click to jump to pinned message">
+          <span class="pinned-badge">📌 Pinned</span>
+          <span class="pinned-text" id="pinned-banner-text"></span>
+        </div>
+        <button type="button" class="icon-btn" id="unpin-banner-btn" title="Unpin message" style="min-width:28px;min-height:28px;padding:4px;">✕</button>
+      </div>
+
       <div id="pull-refresh-circle" aria-hidden="true">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
@@ -1795,7 +2504,13 @@ OFFLINE_HTML = """<!DOCTYPE html>
           <button type="button" class="icon-btn" id="record-btn" title="Record voice note">
             <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
           </button>
-          <input type="text" id="msg-input" placeholder="Type a message here..." autocomplete="off" />
+          <button type="button" class="icon-btn" id="poll-btn" title="Create Live Poll">
+            <svg viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="ai-slash-btn" title="Offline AI & Slash Commands (/summarize, /ask, /todo, /remind, /help)">
+            <svg viewBox="0 0 24 24"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8L12 2z"/></svg>
+          </button>
+          <textarea id="msg-input" rows="1" placeholder="Type a message or /help (/summarize, /ask, /todo, /remind, ```code```)"></textarea>
           <button type="submit" class="send-circle-btn" title="Send">
             <svg viewBox="0 0 24 24" width="17" height="17" stroke="currentColor" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
@@ -1824,6 +2539,44 @@ OFFLINE_HTML = """<!DOCTYPE html>
         <div class="quick-people-list" id="quick-people-list"></div>
       </div>
     </aside>
+  </div>
+
+  <div id="thread-drawer">
+    <div class="thread-hdr">
+      <div>
+        <div class="chat-title">Thread</div>
+        <div class="chat-status" id="thread-sub-status">Replies in thread</div>
+      </div>
+      <button type="button" class="icon-btn" id="thread-close-btn" title="Close thread">✕</button>
+    </div>
+    <div class="thread-parent-box" id="thread-parent-box"></div>
+    <div class="thread-list" id="thread-messages"></div>
+    <div class="composer-wrap">
+      <form class="composer" id="thread-composer">
+        <input type="text" id="thread-input" placeholder="Reply in thread..." autocomplete="off" required />
+        <button type="submit" class="send-circle-btn" title="Send reply">
+          <svg viewBox="0 0 24 24" width="17" height="17" stroke="currentColor" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <div id="poll-modal">
+    <form class="poll-modal-card" id="poll-form">
+      <div class="vault-header">
+        <div class="chat-title">Create Live Poll</div>
+        <button type="button" class="icon-btn" id="poll-close-btn" title="Close">✕</button>
+      </div>
+      <input type="text" id="poll-question-input" placeholder="Ask a question..." required maxlength="160" />
+      <div id="poll-options-wrap" style="display:flex;flex-direction:column;gap:8px;">
+        <input type="text" class="poll-opt-input" placeholder="Option 1" required maxlength="80" />
+        <input type="text" class="poll-opt-input" placeholder="Option 2" required maxlength="80" />
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+        <button type="button" class="pill-icon-btn" id="add-poll-opt-btn">+ Add Option</button>
+        <button type="submit" class="primary-btn">Send Poll</button>
+      </div>
+    </form>
   </div>
 
   <div id="vault-modal">
@@ -1890,6 +2643,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         <video id="remote-video" autoplay playsinline></video>
         <video id="local-video" autoplay muted playsinline></video>
       </div>
+      <div id="huddle-grid"></div>
       <div class="call-controls" id="call-controls"></div>
     </div>
   </div>
@@ -2187,8 +2941,85 @@ OFFLINE_HTML = """<!DOCTYPE html>
     }
 
     function escapeHtml(str) {
-      return str.replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+      return (str || "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
     }
+
+    const TOKEN_REGEX = /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*)|("{3}[\s\S]*?"{3}|\x27{3}[\s\S]*?\x27{3}|"(?:\\.|[^"\\\n])*"|\x27(?:\\.|[^\x27\\\n])*\x27)|(@[a-zA-Z_]\w*)|\b(def|class|return|import|from|as|async|await|if|elif|else|for|while|try|except|finally|with|lambda|yield|pass|break|continue|True|False|None|and|or|not|in|is|self|public|private|protected|static|final|void|int|long|double|float|boolean|char|byte|short|String|new|this|super|extends|implements|interface|package|throws|throw|catch|synchronized|enum|record|var|val|const|let|function|export|default|switch|case|typeof|instanceof|null|undefined|true|false|struct|include|using|namespace|SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|JOIN|GROUP|BY|ORDER|LIMIT|CREATE|TABLE)\b|\b(print|len|range|list|dict|set|tuple|open|enumerate|zip|map|filter|System|out|println|printf|Scanner|ArrayList|HashMap|List|Map|Set|Optional|Math|console|log|JSON|Promise|fetch|document|window)\b|\b(\d+(?:\.\d+)?)\b/g;
+
+    function detectCodeLang(code) {
+      if (/\b(public\s+class|public\s+static\s+void\s+main|System\.out\.print|@Override|import\s+java\.)/.test(code)) return "java";
+      if (/\b(def\s+\w+|import\s+\w+|from\s+\w+\s+import|print\s*\(|elif\b|self\b)/.test(code)) return "python";
+      if (/\b(#include\s*<|std::|cout\s*<<|int\s+main\s*\()/.test(code)) return "cpp";
+      if (/\b(const\s+\w+|let\s+\w+|console\.log|function\s+\w+|=>)/.test(code)) return "javascript";
+      if (/\b(SELECT\s+.+\s+FROM|INSERT\s+INTO|CREATE\s+TABLE)/i.test(code)) return "sql";
+      if (/^\s*[\{\[]/.test(code) && /[\}\]]\s*$/.test(code)) return "json";
+      return "code";
+    }
+
+    function highlightCodeRaw(rawCode) {
+      let result = "";
+      let lastIndex = 0;
+      TOKEN_REGEX.lastIndex = 0;
+      let match;
+      while ((match = TOKEN_REGEX.exec(rawCode)) !== null) {
+        if (match.index > lastIndex) {
+          result += escapeHtml(rawCode.slice(lastIndex, match.index));
+        }
+        const [full, cmt, str, dec, kw, bi, num] = match;
+        const cls = cmt ? "tok-cmt" : str ? "tok-str" : dec ? "tok-dec" : kw ? "tok-kw" : bi ? "tok-bi" : "tok-num";
+        result += `<span class="${cls}">${escapeHtml(full)}</span>`;
+        lastIndex = TOKEN_REGEX.lastIndex;
+      }
+      if (lastIndex < rawCode.length) {
+        result += escapeHtml(rawCode.slice(lastIndex));
+      }
+      return result;
+    }
+
+    function formatRichText(raw) {
+      if (!raw) return "";
+      const blocks = [];
+      let text = String(raw).replace(/```[ \t]*([a-zA-Z0-9_+#.-]*)[ \t]*\r?\n?([\s\S]*?)```/g, (_, lang, code) => {
+        const idx = blocks.length;
+        let cleanCode = (code || "").replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+        let chosenLang = (lang || "").trim().toLowerCase();
+        if (!chosenLang) {
+          const firstLineMatch = cleanCode.match(/^([a-zA-Z0-9_+#.-]+)[ \t]*\r?\n([\s\S]+)$/);
+          if (firstLineMatch && ["python", "py", "java", "c", "cpp", "c++", "js", "javascript", "ts", "typescript", "sql", "json", "html", "css", "bash", "sh", "go", "rust"].includes(firstLineMatch[1].toLowerCase())) {
+            chosenLang = firstLineMatch[1].toLowerCase();
+            cleanCode = firstLineMatch[2];
+          }
+        }
+        if (!chosenLang) chosenLang = detectCodeLang(cleanCode);
+        const langLabel = escapeHtml(chosenLang);
+        const encodedRaw = encodeURIComponent(cleanCode);
+        const html = `<div class="code-block-wrap">` +
+          `<div class="code-block-hdr"><span>${langLabel}</span>` +
+          `<button type="button" class="copy-code-btn" data-code="${encodedRaw}" onclick="copyCodeBlock(this)">Copy Code</button></div>` +
+          `<pre class="code-block-pre"><code>${highlightCodeRaw(cleanCode)}</code></pre>` +
+          `</div>`;
+        blocks.push(html);
+        return `@@CODEBLOCK_${idx}@@`;
+      });
+      text = escapeHtml(text)
+        .replace(/`([^`\n]+)`/g, "<code class=\"inline-code\">$1</code>")
+        .replace(/\*\*([^\*\n]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*([^\*\n]+)\*/g, "<em>$1</em>")
+        .replace(/\n/g, "<br/>");
+      blocks.forEach((bHtml, idx) => {
+        text = text.replace(`@@CODEBLOCK_${idx}@@`, bHtml);
+      });
+      return text;
+    }
+
+    window.copyCodeBlock = async (btn) => {
+      try {
+        const raw = decodeURIComponent(btn.dataset.code || "");
+        await navigator.clipboard.writeText(raw);
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy Code"; }, 1400);
+      } catch {}
+    };
 
     function authHeaders(extra = {}) {
       return { ...extra, "X-Auth-Token": authToken };
@@ -2229,10 +3060,11 @@ OFFLINE_HTML = """<!DOCTYPE html>
       clearBtn.title = (room.isGroup && room.createdBy === me && room.id !== "group:general")
         ? "Delete Group"
         : "Clear Chat";
-      const showCallBtns = !room.isGroup && Boolean(room.peer);
       document.getElementById("group-invite-btn").style.display = room.isGroup ? "inline-flex" : "none";
-      document.getElementById("voice-call-btn").style.display = showCallBtns ? "inline-flex" : "none";
-      document.getElementById("video-call-btn").style.display = showCallBtns ? "inline-flex" : "none";
+      document.getElementById("voice-call-btn").style.display = "inline-flex";
+      document.getElementById("video-call-btn").style.display = "inline-flex";
+      document.getElementById("voice-call-btn").title = room.isGroup ? "Join Group Voice Huddle" : "Voice call";
+      document.getElementById("video-call-btn").title = room.isGroup ? "Join Group Video Huddle" : "Video call";
       renderSidebar();
 
       const cached = loadRoomCache(room.id);
@@ -2289,6 +3121,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         if (fresh.length > 0 || !cached) {
           messagesEl.scrollTop = messagesEl.scrollHeight;
           renderQuickFiles();
+          renderPinnedBanner();
         }
         saveRoomCache(room.id, roomMessages);
       } catch {}
@@ -2331,12 +3164,15 @@ OFFLINE_HTML = """<!DOCTYPE html>
             body += `<a class="file-link" href="${m.file_url}" download="${escapeHtml(fname)}">${escapeHtml(fname)}</a>`;
           }
         }
-        if (m.content) {
-          body += `<div class="bubble-text">${escapeHtml(m.content)}</div>`;
+        if (m.msg_type === "poll" && m.content) {
+          body += renderPollHtml(m);
+        } else if (m.content) {
+          body += `<div class="bubble-text">${formatRichText(m.content)}</div>`;
         }
       }
+      const pinTag = m.pinned && !m.deleted_for_all ? `<span title="Pinned">📌</span>` : "";
       const editedTag = m.edited_at && !m.deleted_for_all ? `<span class="edited-tag">(edited)</span>` : "";
-      body += `<div class="bubble-meta">${editedTag}<span>${escapeHtml((m.created_at || "").slice(11, 16))}</span>${isMe && !m.deleted_for_all ? ticksHtml(m.status) : ""}</div>`;
+      body += `<div class="bubble-meta">${pinTag}${editedTag}<span>${escapeHtml((m.created_at || "").slice(11, 16))}</span>${isMe && !m.deleted_for_all ? ticksHtml(m.status) : ""}</div>`;
       return body;
     }
 
@@ -2348,6 +3184,9 @@ OFFLINE_HTML = """<!DOCTYPE html>
     document.addEventListener("click", closeAllMenus);
 
     function appendMessage(m, skipExtras = false) {
+      if (m.thread_parent_id) {
+        return;
+      }
       const isMe = m.sender === me;
       const row = document.createElement("div");
       row.className = "msg-row" + (isMe ? " me" : "");
@@ -2373,6 +3212,11 @@ OFFLINE_HTML = """<!DOCTYPE html>
       renderReactionsInto(rxBar, m.id, m.reactions || {});
       bubbleWrap.appendChild(rxBar);
 
+      const tChipWrap = document.createElement("div");
+      tChipWrap.dataset.threadChipFor = String(m.id);
+      renderThreadChipInto(tChipWrap, m.id, m.thread_count || 0);
+      bubbleWrap.appendChild(tChipWrap);
+
       row.appendChild(bubbleWrap);
 
       if (!m.deleted_for_all) {
@@ -2389,6 +3233,8 @@ OFFLINE_HTML = """<!DOCTYPE html>
           emojis.map(em => `<button type="button" onclick="reactMsg(${m.id}, '${em}')">${em}</button>`).join("") +
           `</div>`;
         menuHtml += `<button type="button" onclick="replyMsg(${m.id})">Reply</button>`;
+        menuHtml += `<button type="button" onclick="openThread(${m.id})">Thread</button>`;
+        menuHtml += `<button type="button" onclick="pinMsg(${m.id})">${m.pinned ? "Unpin" : "Pin"}</button>`;
         if (isMe && m.msg_type === "text") {
           menuHtml += `<button type="button" onclick="editMsg(${m.id})">Edit</button>`;
         }
@@ -2521,6 +3367,113 @@ OFFLINE_HTML = """<!DOCTYPE html>
       setTimeout(() => target.classList.remove("msg-highlight"), 1200);
     };
 
+    function renderPollHtml(m) {
+      let pollData = { question: "Poll", options: [] };
+      try { pollData = JSON.parse(m.content); } catch {
+        return `<div class="bubble-text">${escapeHtml(m.content)}</div>`;
+      }
+      const votesMap = m.poll_votes || {};
+      let totalVotes = 0;
+      Object.values(votesMap).forEach(arr => { totalVotes += (arr ? arr.length : 0); });
+      const optsHtml = (pollData.options || []).map((opt, idx) => {
+        const voters = votesMap[String(idx)] || [];
+        const cnt = voters.length;
+        const pct = totalVotes > 0 ? Math.round((cnt / totalVotes) * 100) : 0;
+        const iVoted = voters.includes(me);
+        return `<button type="button" class="poll-opt ${iVoted ? "voted" : ""}" onclick="votePoll(${m.id}, ${idx})">` +
+          `<div class="poll-opt-top"><span>${iVoted ? "✓ " : ""}${escapeHtml(opt)}</span><span>${cnt} (${pct}%)</span></div>` +
+          `<div class="poll-bar-track"><div class="poll-bar-fill" style="width:${pct}%"></div></div>` +
+          `</button>`;
+      }).join("");
+      return `<div class="poll-box" data-poll-msg-id="${m.id}">` +
+        `<div class="poll-q">📊 ${escapeHtml(pollData.question || "Poll")}</div>` +
+        optsHtml +
+        `<div class="poll-footer">${totalVotes} vote${totalVotes === 1 ? "" : "s"} • Tap an option to vote</div>` +
+        `</div>`;
+    }
+
+    function renderPinnedBanner() {
+      const banner = document.getElementById("pinned-banner");
+      const textEl = document.getElementById("pinned-banner-text");
+      if (!banner || !textEl) return;
+      const pinnedList = roomMessages.filter(m => m.pinned && !m.deleted_for_all);
+      if (pinnedList.length === 0) {
+        banner.classList.remove("active");
+        return;
+      }
+      const latest = pinnedList[pinnedList.length - 1];
+      let preview = latest.content || latest.file_name || "Attachment";
+      if (latest.msg_type === "poll") {
+        try { preview = "📊 " + (JSON.parse(latest.content).question || "Poll"); } catch {}
+      }
+      textEl.textContent = `${latest.sender}: ${preview}`;
+      document.getElementById("pinned-banner-jump").onclick = () => scrollToMsg(latest.id);
+      document.getElementById("unpin-banner-btn").onclick = (e) => {
+        e.stopPropagation();
+        pinMsg(latest.id, false);
+      };
+      banner.classList.add("active");
+    }
+
+    window.pinMsg = (id, forcedState = null) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const payload = { type: "pin_message", id };
+        if (forcedState !== null) payload.pinned = forcedState;
+        ws.send(JSON.stringify(payload));
+      }
+    };
+
+    window.votePoll = (id, option_idx) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "vote_poll", id, option_idx }));
+      }
+    };
+
+    const pollModal = document.getElementById("poll-modal");
+    const pollOptionsWrap = document.getElementById("poll-options-wrap");
+    document.getElementById("poll-btn").onclick = () => {
+      document.getElementById("poll-question-input").value = "";
+      pollOptionsWrap.innerHTML = `
+        <input type="text" class="poll-opt-input" placeholder="Option 1" required maxlength="80" />
+        <input type="text" class="poll-opt-input" placeholder="Option 2" required maxlength="80" />
+      `;
+      pollModal.classList.add("active");
+      document.getElementById("poll-question-input").focus();
+    };
+    document.getElementById("poll-close-btn").onclick = () => pollModal.classList.remove("active");
+    document.getElementById("add-poll-opt-btn").onclick = () => {
+      const count = pollOptionsWrap.querySelectorAll(".poll-opt-input").length;
+      if (count >= 5) return;
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "poll-opt-input";
+      inp.placeholder = `Option ${count + 1}`;
+      inp.maxLength = 80;
+      pollOptionsWrap.appendChild(inp);
+    };
+    document.getElementById("poll-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const question = document.getElementById("poll-question-input").value.trim();
+      const options = Array.from(pollOptionsWrap.querySelectorAll(".poll-opt-input"))
+        .map(i => i.value.trim())
+        .filter(Boolean);
+      if (!question || options.length < 2) {
+        alert("Please enter a question and at least 2 options.");
+        return;
+      }
+      const encContent = await encryptForRoom(activeRoom.id, JSON.stringify({ question, options }));
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "message",
+          room_id: activeRoom.id,
+          peer: activeRoom.peer,
+          content: encContent,
+          msg_type: "poll",
+        }));
+      }
+      pollModal.classList.remove("active");
+    };
+
     window.reactMsg = (id, emoji) => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "react", id, emoji }));
@@ -2544,8 +3497,8 @@ OFFLINE_HTML = """<!DOCTYPE html>
     };
 
     window.editMsg = async (id) => {
-      const el = document.querySelector(`.bubble[data-msg-id="${id}"] .bubble-text`);
-      const current = el ? el.textContent : "";
+      const msgObj = roomMessages.find(x => x.id === id);
+      const current = msgObj ? msgObj.content : "";
       const next = prompt("Edit message:", current);
       if (!next || !next.trim() || next.trim() === current) return;
       const payloadText = await encryptForRoom(activeRoom.id, next.trim());
@@ -2742,7 +3695,20 @@ OFFLINE_HTML = """<!DOCTYPE html>
             msg.file_url = await decryptMediaUrl(msg.room_id, msg.file_url, msg.file_name);
           }
           if (msg.room_id === activeRoom.id) {
-            appendMessage(msg);
+            if (msg.thread_parent_id) {
+              const parent = roomMessages.find(x => x.id === msg.thread_parent_id);
+              if (parent) {
+                parent.thread_count = msg.parent_thread_count || ((parent.thread_count || 0) + 1);
+                const chipWrap = document.querySelector(`[data-thread-chip-for="${parent.id}"]`);
+                if (chipWrap) renderThreadChipInto(chipWrap, parent.id, parent.thread_count);
+                saveRoomCache(activeRoom.id, roomMessages);
+              }
+              if (activeThreadParent && activeThreadParent.id === msg.thread_parent_id) {
+                appendThreadReplyDom(msg);
+              }
+            } else {
+              appendMessage(msg);
+            }
             if (msg.sender !== me) sendMarkRead(activeRoom.id);
           } else {
             unread[msg.room_id] = (unread[msg.room_id] || 0) + 1;
@@ -2754,11 +3720,34 @@ OFFLINE_HTML = """<!DOCTYPE html>
         } else if (data.type === "reaction_updated") {
           const bar = document.querySelector(`.reaction-bar[data-rx-msg-id="${data.id}"]`);
           if (bar) renderReactionsInto(bar, data.id, data.reactions || {});
+        } else if (data.type === "message_pinned") {
+          const target = roomMessages.find(x => x.id === data.id);
+          if (target) {
+            target.pinned = data.pinned;
+            const bubble = document.querySelector(`.bubble[data-msg-id="${data.id}"]`);
+            if (bubble) bubble.innerHTML = renderBubbleInner(target);
+            renderPinnedBanner();
+            saveRoomCache(data.room_id || activeRoom.id, roomMessages);
+          }
+        } else if (data.type === "poll_updated") {
+          const target = roomMessages.find(x => x.id === data.id);
+          if (target) {
+            target.poll_votes = data.poll_votes || {};
+            const bubble = document.querySelector(`.bubble[data-msg-id="${data.id}"]`);
+            if (bubble) bubble.innerHTML = renderBubbleInner(target);
+            saveRoomCache(data.room_id || activeRoom.id, roomMessages);
+          }
         } else if (data.type === "message_edited") {
+          const decText = await decryptContent(data.room_id, data.content);
+          const msgObj = roomMessages.find(x => x.id === data.id);
+          if (msgObj) {
+            msgObj.content = decText;
+            msgObj.edited_at = data.edited_at;
+          }
           const el = document.querySelector(`.bubble[data-msg-id="${data.id}"]`);
           if (el) {
             const textEl = el.querySelector(".bubble-text");
-            if (textEl) textEl.textContent = await decryptContent(data.room_id, data.content);
+            if (textEl) textEl.innerHTML = formatRichText(decText);
             const meta = el.querySelector(".bubble-meta");
             if (meta && !meta.querySelector(".edited-tag")) {
               meta.insertAdjacentHTML("afterbegin", `<span class="edited-tag">(edited)</span>`);
@@ -2779,11 +3768,13 @@ OFFLINE_HTML = """<!DOCTYPE html>
             targetMsg.file_name = null;
           }
           renderQuickFiles();
+          renderPinnedBanner();
         } else if (data.type === "message_hidden") {
           const row = document.querySelector(`.msg-row[data-msg-id="${data.id}"]`);
           if (row) row.remove();
           roomMessages = roomMessages.filter(x => x.id !== data.id);
           renderQuickFiles();
+          renderPinnedBanner();
         } else if (data.type === "room_deleted") {
           rooms = rooms.filter(r => r.id !== data.room_id);
           renderSidebar();
@@ -2792,6 +3783,8 @@ OFFLINE_HTML = """<!DOCTYPE html>
           }
         } else if (data.type === "webrtc_signal") {
           await handleWebRTCSignal(data);
+        } else if (data.type === "huddle_peers" || data.type === "huddle_joined" || data.type === "huddle_left" || data.type === "huddle_signal") {
+          await handleHuddleEvent(data);
         } else if (data.type === "error") {
           alert(data.detail || "Action not allowed.");
         }
@@ -3142,7 +4135,99 @@ OFFLINE_HTML = """<!DOCTYPE html>
       });
     };
 
+    let activeThreadParent = null;
+    const threadDrawer = document.getElementById("thread-drawer");
+    const threadParentBox = document.getElementById("thread-parent-box");
+    const threadMessagesEl = document.getElementById("thread-messages");
+    const threadInput = document.getElementById("thread-input");
+
+    function renderThreadChipInto(wrap, msgId, count) {
+      if (!count || count <= 0) {
+        wrap.innerHTML = "";
+        return;
+      }
+      wrap.innerHTML = `<button type="button" class="thread-chip" onclick="openThread(${msgId})">💬 ${count} ${count === 1 ? "reply" : "replies"} • View thread</button>`;
+    }
+
+    function appendThreadReplyDom(r) {
+      const isMe = r.sender === me;
+      const row = document.createElement("div");
+      row.className = "msg-row" + (isMe ? " me" : "");
+      row.style.maxWidth = "92%";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble" + (isMe ? " me" : "");
+      bubble.innerHTML = `<div class="bubble-sender">${escapeHtml(r.sender)}</div>` +
+        `<div class="bubble-text">${formatRichText(r.content)}</div>` +
+        `<div class="bubble-meta"><span>${escapeHtml((r.created_at || "").slice(11, 16))}</span></div>`;
+      row.appendChild(bubble);
+      threadMessagesEl.appendChild(row);
+      threadMessagesEl.scrollTop = threadMessagesEl.scrollHeight;
+    }
+
+    window.openThread = async (msgId) => {
+      const parent = roomMessages.find(x => x.id === msgId);
+      if (!parent) return;
+      activeThreadParent = parent;
+      threadParentBox.innerHTML = `<div style="font-weight:700;color:var(--accent);font-size:0.78rem;margin-bottom:4px;">${escapeHtml(parent.sender)}</div>` +
+        `<div>${formatRichText(parent.content || parent.file_name || "Attachment")}</div>`;
+      threadMessagesEl.innerHTML = `<div style="color:var(--muted);font-size:0.82rem;">Loading thread...</div>`;
+      threadDrawer.classList.add("active");
+      try {
+        const res = await fetch(`/api/messages/${msgId}/thread`, { headers: authHeaders() });
+        const data = await res.json();
+        const replies = data.replies || [];
+        await Promise.all(replies.map(async (r) => {
+          r.content = await decryptContent(r.room_id, r.content);
+        }));
+        threadMessagesEl.innerHTML = "";
+        if (replies.length === 0) {
+          threadMessagesEl.innerHTML = `<div style="color:var(--muted);font-size:0.82rem;text-align:center;padding:20px 0;">No replies yet. Start the thread below!</div>`;
+        } else {
+          replies.forEach(r => appendThreadReplyDom(r));
+        }
+      } catch {
+        threadMessagesEl.innerHTML = `<div style="color:var(--error);font-size:0.82rem;">Could not load thread.</div>`;
+      }
+      threadInput.focus();
+    };
+
+    document.getElementById("thread-close-btn").onclick = () => {
+      threadDrawer.classList.remove("active");
+      activeThreadParent = null;
+    };
+
+    document.getElementById("thread-composer").onsubmit = async (e) => {
+      e.preventDefault();
+      if (!activeThreadParent) return;
+      const text = threadInput.value.trim();
+      if (!text) return;
+      const enc = await encryptForRoom(activeRoom.id, text);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (threadMessagesEl.querySelector("div[style*='text-align:center']")) {
+          threadMessagesEl.innerHTML = "";
+        }
+        ws.send(JSON.stringify({
+          type: "message",
+          room_id: activeRoom.id,
+          peer: activeRoom.peer,
+          content: enc,
+          msg_type: "text",
+          thread_parent_id: activeThreadParent.id,
+        }));
+      }
+      threadInput.value = "";
+    };
+
+    msgInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        document.getElementById("composer").requestSubmit();
+      }
+    });
+
     msgInput.addEventListener("input", () => {
+      msgInput.style.height = "auto";
+      msgInput.style.height = Math.min(110, msgInput.scrollHeight) + "px";
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       ws.send(JSON.stringify({ type: "typing", room_id: activeRoom.id, is_typing: true }));
       clearTimeout(typingTimer);
@@ -3151,10 +4236,199 @@ OFFLINE_HTML = """<!DOCTYPE html>
       }, 1200);
     });
 
+    function appendLocalAiCard(title, markdownText, engineLabel = "Offline AI", allowShare = true) {
+      const row = document.createElement("div");
+      row.className = "msg-row";
+      row.style.maxWidth = "92%";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.style.border = "1.5px solid rgba(108, 71, 255, 0.35)";
+      bubble.style.background = "linear-gradient(135deg, rgba(108,71,255,0.08), rgba(255,255,255,0.96))";
+      const shareId = "ai-share-" + Date.now() + "-" + Math.floor(Math.random() * 1000);
+      bubble.innerHTML =
+        `<div class="bubble-sender" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">` +
+          `<span>🤖 ${escapeHtml(title)}</span>` +
+          `<span style="font-size:0.68rem;padding:2px 7px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-weight:700;">${escapeHtml(engineLabel)}</span>` +
+        `</div>` +
+        `<div class="bubble-text" style="margin-top:4px;">${formatRichText(markdownText)}</div>` +
+        `<div class="bubble-meta" style="display:flex;align-items:center;justify-content:space-between;margin-top:6px;">` +
+          `<span>Visible to you • 100% Offline</span>` +
+          (allowShare ? `<button type="button" id="${shareId}" class="pill-icon-btn" style="padding:2px 9px;font-size:0.72rem;">Share to Room</button>` : ``) +
+        `</div>`;
+      row.appendChild(bubble);
+      messagesEl.appendChild(row);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (allowShare) {
+        const btn = document.getElementById(shareId);
+        if (btn) {
+          btn.onclick = async () => {
+            btn.disabled = true;
+            btn.textContent = "Shared ✓";
+            const sharedText = `🤖 **${title}** (${engineLabel})\n${markdownText}`;
+            const enc = await encryptForRoom(activeRoom.id, sharedText);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "message",
+                room_id: activeRoom.id,
+                peer: activeRoom.peer,
+                content: enc,
+                msg_type: "text"
+              }));
+            }
+          };
+        }
+      }
+    }
+
+    async function runLocalAiCommand(mode, queryText) {
+      const recentMsgs = (roomMessages || []).slice(-60).map(m => ({
+        sender: m.sender,
+        content: m.content || "",
+        file_name: m.file_name || "",
+        created_at: m.created_at || ""
+      }));
+      appendLocalAiCard(
+        mode === "summarize" ? "Generating Room Summary..." : `Searching Room & Files for "${queryText}"...`,
+        "Analyzing decrypted room messages and local files...",
+        "Working...",
+        false
+      );
+      const loadingRow = messagesEl.lastElementChild;
+      try {
+        const res = await fetch("/api/ai", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({
+            room_id: activeRoom.id,
+            mode,
+            query: queryText,
+            messages: recentMsgs
+          })
+        });
+        const data = await res.json();
+        if (loadingRow) loadingRow.remove();
+        if (!res.ok) {
+          appendLocalAiCard("AI Assistant Error", data.detail || "Could not run local AI.", "Error", false);
+          return;
+        }
+        appendLocalAiCard(
+          mode === "summarize" ? "Offline AI Summary" : "Offline AI RAG Answer",
+          data.answer || "No response generated.",
+          data.engine || "Offline Extractive AI",
+          true
+        );
+      } catch (err) {
+        if (loadingRow) loadingRow.remove();
+        appendLocalAiCard("AI Assistant Error", "Failed to reach local AI endpoint.", "Offline", false);
+      }
+    }
+
+    async function handleSlashCommand(rawText) {
+      const trimmed = rawText.trim();
+      if (!trimmed.startsWith("/")) return false;
+      const parts = trimmed.split(/\s+/);
+      const cmd = parts[0].toLowerCase();
+      const rest = trimmed.slice(parts[0].length).trim();
+
+      if (cmd === "/help" || cmd === "/commands" || cmd === "/webhook") {
+        const originUrl = window.location.origin;
+        const webhookUrl = `${originUrl}/api/webhooks/${encodeURIComponent(activeRoom.id)}`;
+        const helpMd = [
+          "### ⚡ Offline AI & Automation Slash Commands",
+          "- `/summarize` — Summarize recent decrypted messages & action items in this room (uses local Ollama / llama.cpp or built-in Offline Extractive AI)",
+          "- `/ask <question>` — Ask any question across decrypted room messages & shared text/code/PDF files (Local RAG)",
+          "- `/todo <task>` — Broadcast a formatted team action item / TODO card to the room",
+          "- `/remind <time> <note>` — Set a local timer reminder (e.g. `/remind 10m Check build` or `/remind 30s Call teammate`)",
+          "- `/webhook` — View the local LAN Incoming Webhook `curl` command for this room",
+          "```bash\ncurl -k -X POST " + webhookUrl + " -H \"Content-Type: application/json\" -d '{\"sender\":\"GitBot\",\"text\":\"Build #42 passed on LAN!\"}'\n```"
+        ].join("\n");
+        appendLocalAiCard("Slash Commands & Incoming Webhook", helpMd, "100% Offline", false);
+        return true;
+      }
+
+      if (cmd === "/summarize" || cmd === "/summary") {
+        await runLocalAiCommand("summarize", rest);
+        return true;
+      }
+
+      if (cmd === "/ask" || cmd === "/ai") {
+        if (!rest) {
+          appendLocalAiCard("Usage: /ask <question>", "Example: `/ask what deadline or bug fix was discussed?`", "Tip", false);
+          return true;
+        }
+        await runLocalAiCommand("ask", rest);
+        return true;
+      }
+
+      if (cmd === "/remind" || cmd === "/reminder") {
+        const m = rest.match(/^(\d+)\s*(s|sec|secs|m|min|mins|h|hr|hrs)\s+(.+)$/i);
+        if (!m) {
+          appendLocalAiCard("Usage: /remind <time> <note>", "Examples:\n- `/remind 30s Call Ambuj`\n- `/remind 10m Check deployment logs`\n- `/remind 1h Team standup`", "Reminder", false);
+          return true;
+        }
+        const amount = parseInt(m[1], 10);
+        const unit = m[2].toLowerCase()[0];
+        const note = m[3].trim();
+        const mult = unit === "h" ? 3600000 : (unit === "m" ? 60000 : 1000);
+        const delayMs = Math.min(amount * mult, 24 * 3600000);
+        appendLocalAiCard("⏰ Reminder Scheduled", `Will remind you in **${amount}${unit}**: "${note}"`, "Local Timer", false);
+        setTimeout(() => {
+          playChime();
+          appendLocalAiCard("🔔 Reminder Alert!", `**${note}** *(scheduled ${amount}${unit} ago)*`, "Timer Done", true);
+          if ("Notification" in window && Notification.permission === "granted") {
+            new Notification("LAN Chat Reminder", { body: note, icon: "/icon.svg" });
+          }
+        }, delayMs);
+        return true;
+      }
+
+      if (cmd === "/todo" || cmd === "/task") {
+        if (!rest) {
+          appendLocalAiCard("Usage: /todo <task>", "Example: `/todo Review SQLite migration & test WebRTC call`", "Todo", false);
+          return true;
+        }
+        const todoFormatted = `📋 **TODO [${me}]:** ${rest}`;
+        const enc = await encryptForRoom(activeRoom.id, todoFormatted);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "message",
+            room_id: activeRoom.id,
+            peer: activeRoom.peer,
+            content: enc,
+            msg_type: "text"
+          }));
+        }
+        return true;
+      }
+
+      return false;
+    }
+
+    document.getElementById("ai-slash-btn").onclick = () => {
+      const cur = msgInput.value.trim();
+      if (!cur) {
+        handleSlashCommand("/help");
+      } else if (cur.startsWith("/")) {
+        document.getElementById("composer").requestSubmit();
+      } else {
+        handleSlashCommand("/ask " + cur);
+        msgInput.value = "";
+        msgInput.style.height = "auto";
+      }
+    };
+
     document.getElementById("composer").onsubmit = async (e) => {
       e.preventDefault();
       const text = msgInput.value.trim();
       if (!text) return;
+      if (text.startsWith("/")) {
+        const handled = await handleSlashCommand(text);
+        if (handled) {
+          msgInput.value = "";
+          msgInput.style.height = "auto";
+          return;
+        }
+      }
       const payloadText = await encryptForRoom(activeRoom.id, text);
       let replyPreviewPayload = replyTo ? replyTo.preview : null;
       if (replyTo) {
@@ -3189,6 +4463,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
         if (lastRow) lastRow.dataset.queued = "1";
       }
       msgInput.value = "";
+      msgInput.style.height = "auto";
       replyTo = null;
       document.getElementById("reply-bar").classList.remove("active");
     };
@@ -3307,7 +4582,10 @@ OFFLINE_HTML = """<!DOCTYPE html>
       minimize: '<svg viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
       expand: '<svg viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
       hangup: '<svg viewBox="0 0 24 24"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/><line x1="23" y1="1" x2="1" y2="23"/></svg>',
-      callAccept: '<svg viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>'
+      callAccept: '<svg viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+      ptt: '<svg viewBox="0 0 24 24"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/></svg>',
+      recStart: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="currentColor"/></svg>',
+      recStop: '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>'
     };
 
     function updateSoundBtn() {
@@ -3506,7 +4784,114 @@ OFFLINE_HTML = """<!DOCTYPE html>
       });
     }
 
+    let huddleRoomId = null;
+    const huddlePCs = {};
+    const huddleStreams = {};
+    let callRecorder = null;
+    let callRecChunks = [];
+    let callRecAudioCtx = null;
+    let isRecordingCall = false;
+    let pttActive = false;
+    const huddleGridEl = document.getElementById("huddle-grid");
+
+    function stopCallRecording() {
+      if (callRecorder && callRecorder.state === "recording") {
+        callRecorder.stop();
+      }
+      isRecordingCall = false;
+    }
+
+    async function toggleCallRecording() {
+      if (isRecordingCall) {
+        stopCallRecording();
+        renderActiveCallControls();
+        return;
+      }
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        callRecAudioCtx = new AudioCtx();
+        const dest = callRecAudioCtx.createMediaStreamDestination();
+        if (callStream && callStream.getAudioTracks().length > 0) {
+          callRecAudioCtx.createMediaStreamSource(new MediaStream(callStream.getAudioTracks())).connect(dest);
+        }
+        if (remoteVideo.srcObject instanceof MediaStream && remoteVideo.srcObject.getAudioTracks().length > 0) {
+          callRecAudioCtx.createMediaStreamSource(new MediaStream(remoteVideo.srcObject.getAudioTracks())).connect(dest);
+        }
+        Object.values(huddleStreams).forEach(st => {
+          if (st instanceof MediaStream && st.getAudioTracks().length > 0) {
+            callRecAudioCtx.createMediaStreamSource(new MediaStream(st.getAudioTracks())).connect(dest);
+          }
+        });
+        const combinedTracks = [...dest.stream.getAudioTracks()];
+        if (callIsVideo && !huddleRoomId) {
+          const vStream = isSharingScreen && screenStream ? screenStream : (remoteVideo.srcObject || callStream);
+          if (vStream instanceof MediaStream && vStream.getVideoTracks()[0]) {
+            combinedTracks.push(vStream.getVideoTracks()[0]);
+          }
+        }
+        const recTargetStream = new MediaStream(combinedTracks);
+        callRecChunks = [];
+        callRecorder = new MediaRecorder(recTargetStream);
+        callRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) callRecChunks.push(e.data);
+        };
+        callRecorder.onstop = async () => {
+          if (callRecAudioCtx) {
+            callRecAudioCtx.close().catch(() => {});
+            callRecAudioCtx = null;
+          }
+          const mime = callRecorder.mimeType || (combinedTracks.some(t => t.kind === "video") ? "video/webm" : "audio/webm");
+          const blob = new Blob(callRecChunks, { type: mime });
+          if (blob.size === 0) return;
+          const fname = `call_recording_${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.webm`;
+          const res = await uploadEncryptedOrPlain(blob, fname);
+          if (res.ok && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "message",
+              room_id: activeRoom.id,
+              peer: activeRoom.peer,
+              content: "🎙️ Call recording saved to Shared Vault",
+              msg_type: res.data.msg_type,
+              file_name: res.data.file_name,
+              file_url: res.data.file_url,
+            }));
+          }
+        };
+        callRecorder.start();
+        isRecordingCall = true;
+        renderActiveCallControls();
+      } catch (err) {
+        alert("Could not start call recording: " + (err.message || err));
+      }
+    }
+
+    function setPttTalking(talking) {
+      if (!callStream) return;
+      pttActive = talking;
+      if (talking) {
+        callStream.getAudioTracks().forEach(t => { t.enabled = true; });
+        callStatusEl.textContent = "🎙️ Push-to-Talk transmitting...";
+      } else {
+        callStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
+        callStatusEl.textContent = huddleRoomId ? "Group Huddle • Connected" : "ICE: connected";
+      }
+      const pttBtn = document.getElementById("call-ptt-btn");
+      if (pttBtn) pttBtn.classList.toggle("ptt-active", talking);
+    }
+
     function endCall(notifyPeer = true) {
+      stopCallRecording();
+      if (huddleRoomId) {
+        if (notifyPeer && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "huddle_signal", room_id: huddleRoomId, action: "leave" }));
+        }
+        Object.values(huddlePCs).forEach(c => { try { c.close(); } catch {} });
+        Object.keys(huddlePCs).forEach(k => delete huddlePCs[k]);
+        Object.keys(huddleStreams).forEach(k => delete huddleStreams[k]);
+        huddleRoomId = null;
+        huddleGridEl.innerHTML = "";
+        huddleGridEl.classList.remove("active");
+      }
       if (notifyPeer && callPeer) sendSignal(callPeer, "hangup");
       stopScreenShareTrackOnly();
       if (pc) { pc.close(); pc = null; }
@@ -3517,6 +4902,7 @@ OFFLINE_HTML = """<!DOCTYPE html>
       pendingOffer = null;
       pendingCandidates = [];
       micMuted = false;
+      pttActive = false;
       callModal.classList.remove("active", "minimized");
       const topMinBtn = document.getElementById("call-min-toggle-btn");
       topMinBtn.innerHTML = SVG_ICONS.minimize;
@@ -3614,7 +5000,26 @@ OFFLINE_HTML = """<!DOCTYPE html>
       };
       callControlsEl.appendChild(muteBtn);
 
-      if (callIsVideo) {
+      const pttBtn = document.createElement("button");
+      pttBtn.type = "button";
+      pttBtn.id = "call-ptt-btn";
+      pttBtn.className = "icon-btn" + (pttActive ? " ptt-active" : "");
+      pttBtn.innerHTML = SVG_ICONS.ptt;
+      pttBtn.title = "Push-to-Talk: Hold to talk (or hold Spacebar when muted)";
+      pttBtn.onpointerdown = () => setPttTalking(true);
+      pttBtn.onpointerup = () => setPttTalking(false);
+      pttBtn.onpointerleave = () => { if (pttActive) setPttTalking(false); };
+      callControlsEl.appendChild(pttBtn);
+
+      const recCallBtn = document.createElement("button");
+      recCallBtn.type = "button";
+      recCallBtn.className = "icon-btn" + (isRecordingCall ? " rec-active" : "");
+      recCallBtn.innerHTML = isRecordingCall ? SVG_ICONS.recStop : SVG_ICONS.recStart;
+      recCallBtn.title = isRecordingCall ? "Stop Recording & Save to Vault" : "Record Call to Shared Vault";
+      recCallBtn.onclick = toggleCallRecording;
+      callControlsEl.appendChild(recCallBtn);
+
+      if (callIsVideo && !huddleRoomId) {
         const screenBtn = document.createElement("button");
         screenBtn.type = "button";
         screenBtn.className = isSharingScreen ? "primary-btn" : "icon-btn";
@@ -3698,7 +5103,160 @@ OFFLINE_HTML = """<!DOCTYPE html>
       return conn;
     }
 
+    function renderHuddleTile(username, stream, muted = false) {
+      let tile = document.getElementById(`huddle-tile-${username}`);
+      if (!tile) {
+        tile = document.createElement("div");
+        tile.id = `huddle-tile-${username}`;
+        tile.className = "huddle-tile";
+        tile.innerHTML = `<video autoplay playsinline ${muted ? "muted" : ""}></video><span class="huddle-tile-label">${escapeHtml(username)}</span>`;
+        huddleGridEl.appendChild(tile);
+      }
+      const vid = tile.querySelector("video");
+      if (vid && vid.srcObject !== stream) {
+        vid.srcObject = stream;
+        vid.play().catch(() => {});
+      }
+    }
+
+    function createHuddlePeerConnection(peer) {
+      if (huddlePCs[peer]) return huddlePCs[peer];
+      const conn = new RTCPeerConnection({ iceServers: [] });
+      huddlePCs[peer] = conn;
+      if (callStream) {
+        callStream.getTracks().forEach(t => conn.addTrack(t, callStream));
+      }
+      conn.onicecandidate = (e) => {
+        if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "huddle_signal",
+            room_id: huddleRoomId,
+            target: peer,
+            action: "ice",
+            payload: e.candidate,
+          }));
+        }
+      };
+      conn.ontrack = (e) => {
+        const st = (e.streams && e.streams[0]) || new MediaStream([e.track]);
+        huddleStreams[peer] = st;
+        renderHuddleTile(peer, st, false);
+      };
+      return conn;
+    }
+
+    async function startGroupHuddle(isVideo) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert("Group Huddle requires HTTPS or 127.0.0.1 in this browser.");
+        return;
+      }
+      try {
+        huddleRoomId = activeRoom.id;
+        callIsVideo = isVideo;
+        try {
+          callStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: isVideo });
+        } catch {
+          callStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        }
+        callVideosEl.style.display = "none";
+        huddleGridEl.innerHTML = "";
+        huddleGridEl.classList.add("active");
+        renderHuddleTile(`${me} (You)`, callStream, true);
+
+        callPeerEl.textContent = `# ${activeRoom.name} Huddle`;
+        callStatusEl.textContent = "Group Huddle • Connecting...";
+        toggleCallMinimized(false);
+        callModal.classList.add("active");
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "huddle_signal", room_id: huddleRoomId, action: "join", video: isVideo }));
+        }
+      } catch (err) {
+        alert("Could not join Group Huddle: " + (err.message || err));
+        endCall(false);
+      }
+    }
+
+    async function handleHuddleEvent(data) {
+      if (data.type === "huddle_joined") {
+        pushNotif(`${data.username} joined huddle in ${data.room_id}`);
+        if (huddleRoomId === data.room_id) {
+          callStatusEl.textContent = `Group Huddle • ${data.count || 1} in room`;
+        }
+        return;
+      }
+      if (data.type === "huddle_left") {
+        if (huddlePCs[data.username]) {
+          try { huddlePCs[data.username].close(); } catch {}
+          delete huddlePCs[data.username];
+        }
+        delete huddleStreams[data.username];
+        const tile = document.getElementById(`huddle-tile-${data.username}`);
+        if (tile) tile.remove();
+        if (huddleRoomId === data.room_id) {
+          callStatusEl.textContent = `Group Huddle • ${data.count || 1} in room`;
+        }
+        return;
+      }
+      if (!huddleRoomId || data.room_id !== huddleRoomId) return;
+      if (data.type === "huddle_peers") {
+        const peers = data.peers || [];
+        callStatusEl.textContent = `Group Huddle • ${peers.length + 1} in room`;
+        for (const peer of peers) {
+          const conn = createHuddlePeerConnection(peer);
+          const offer = await conn.createOffer();
+          await conn.setLocalDescription(offer);
+          ws.send(JSON.stringify({
+            type: "huddle_signal",
+            room_id: huddleRoomId,
+            target: peer,
+            action: "offer",
+            payload: offer,
+          }));
+        }
+      } else if (data.type === "huddle_signal") {
+        const peer = data.from;
+        const conn = createHuddlePeerConnection(peer);
+        if (data.action === "offer") {
+          await conn.setRemoteDescription(new RTCSessionDescription(data.payload));
+          const ans = await conn.createAnswer();
+          await conn.setLocalDescription(ans);
+          ws.send(JSON.stringify({
+            type: "huddle_signal",
+            room_id: huddleRoomId,
+            target: peer,
+            action: "answer",
+            payload: ans,
+          }));
+        } else if (data.action === "answer") {
+          await conn.setRemoteDescription(new RTCSessionDescription(data.payload));
+        } else if (data.action === "ice" && data.payload) {
+          try { await conn.addIceCandidate(new RTCIceCandidate(data.payload)); } catch {}
+        }
+      }
+    }
+
+    // Spacebar Push-to-Talk (Walkie-Talkie) during active Calls / Group Huddles
+    document.addEventListener("keydown", (e) => {
+      const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
+      if (tag === "input" || tag === "textarea") return;
+      if (e.code === "Space" && callModal.classList.contains("active") && micMuted && !pttActive) {
+        e.preventDefault();
+        setPttTalking(true);
+      }
+    });
+    document.addEventListener("keyup", (e) => {
+      if (e.code === "Space" && pttActive) {
+        e.preventDefault();
+        setPttTalking(false);
+      }
+    });
+
     async function startCall(isVideo) {
+      if (activeRoom.isGroup) {
+        await startGroupHuddle(isVideo);
+        return;
+      }
       if (!activeRoom.peer) return;
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         alert("Calling requires HTTPS or 127.0.0.1 in this browser.");
@@ -4022,7 +5580,15 @@ if __name__ == "__main__":
         else {}
     )
     try:
-        uvicorn.run(app, host="0.0.0.0", port=port, **ssl_kwargs)
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            timeout_graceful_shutdown=2,
+            ws_ping_interval=20,
+            ws_ping_timeout=15,
+            **ssl_kwargs,
+        )
     finally:
         if mdns_handle:
             zc, info = mdns_handle
