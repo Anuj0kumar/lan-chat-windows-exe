@@ -34,6 +34,7 @@ jobs:
       - name: Install dependencies & PyInstaller
         run: pip install pyinstaller -r requirements.txt
       - name: Build LAN-Chat.exe
+        shell: cmd
         run: |
           pyinstaller --onefile --name "LAN-Chat" ^
             --hidden-import=uvicorn.logging ^
