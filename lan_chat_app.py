@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 import uuid
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,9 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]{2,24}$")
 PIN_RE = re.compile(r"^\d{4,8}$")
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
+BRAND_NAME = os.environ.get("LAN_CHAT_BRAND_NAME", "LAN Chat").strip() or "LAN Chat"
+BRAND_TAGLINE = os.environ.get("LAN_CHAT_BRAND_TAGLINE", "Zero-data local Wi-Fi chat. Each device IP gets one account; enter your PIN if your IP changes.").strip()
+BRAND_ACCENT = os.environ.get("LAN_CHAT_ACCENT_COLOR", "").strip()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -88,11 +91,18 @@ def parse_utc(ts: str | None) -> datetime | None:
         return None
 
 
-def get_db() -> sqlite3.Connection:
+@contextmanager
+def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 async def run_db(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -206,10 +216,34 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN device_ip TEXT NOT NULL DEFAULT ''")
         if "public_key" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN public_key TEXT NOT NULL DEFAULT ''")
+        if "role" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'")
+        if "banned" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
+        if "department" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN department TEXT NOT NULL DEFAULT ''")
+        if "status_text" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN status_text TEXT NOT NULL DEFAULT ''")
 
         room_cols = {r["name"] for r in conn.execute("PRAGMA table_info(rooms)").fetchall()}
         if "created_by" not in room_cols:
             conn.execute("ALTER TABLE rooms ADD COLUMN created_by TEXT NOT NULL DEFAULT ''")
+        if "passcode_hash" not in room_cols:
+            conn.execute("ALTER TABLE rooms ADD COLUMN passcode_hash TEXT NOT NULL DEFAULT ''")
+        if "announce_only" not in room_cols:
+            conn.execute("ALTER TABLE rooms ADD COLUMN announce_only INTEGER NOT NULL DEFAULT 0")
+        if "disappear_seconds" not in room_cols:
+            conn.execute("ALTER TABLE rooms ADD COLUMN disappear_seconds INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS room_members (
+                room_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (room_id, username)
+            )
+            """
+        )
 
         msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "status" not in msg_cols:
@@ -230,6 +264,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
         if "thread_parent_id" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN thread_parent_id INTEGER")
+        if "expires_at" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN expires_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_poll_votes_msg ON poll_votes(message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread_parent ON messages(thread_parent_id)")
 
@@ -241,6 +277,77 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO rooms (id, name, is_group, created_at) VALUES (?, ?, 1, ?)",
             ("group:general", "General", utc_now_iso()),
         )
+
+        # Ensure at least one admin exists (first registered user or LAN_CHAT_ADMINS env)
+        admin_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM users WHERE role = 'admin'").fetchone()["cnt"]
+        if admin_cnt == 0:
+            first_u = conn.execute("SELECT username FROM users ORDER BY rowid ASC LIMIT 1").fetchone()
+            if first_u:
+                conn.execute("UPDATE users SET role = 'admin' WHERE username = ?", (first_u["username"],))
+
+        # SQLite FTS5 Full-Text Search virtual table & triggers (excludes E2EE ciphertext)
+        try:
+            conn.executescript(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    msg_id UNINDEXED,
+                    room_id UNINDEXED,
+                    sender,
+                    content,
+                    file_name
+                );
+
+                CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
+                WHEN new.deleted_for_all = 0
+                BEGIN
+                    INSERT INTO messages_fts(msg_id, room_id, sender, content, file_name)
+                    VALUES (
+                        new.id,
+                        new.room_id,
+                        new.sender,
+                        CASE WHEN new.content LIKE 'E2EE:%' THEN '' ELSE new.content END,
+                        COALESCE(new.file_name, '')
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages
+                BEGIN
+                    DELETE FROM messages_fts WHERE msg_id = old.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages
+                BEGIN
+                    DELETE FROM messages_fts WHERE msg_id = old.id;
+                    INSERT INTO messages_fts(msg_id, room_id, sender, content, file_name)
+                    SELECT
+                        new.id,
+                        new.room_id,
+                        new.sender,
+                        CASE WHEN new.content LIKE 'E2EE:%' THEN '' ELSE new.content END,
+                        COALESCE(new.file_name, '')
+                    WHERE new.deleted_for_all = 0;
+                END;
+                """
+            )
+            fts_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM messages_fts").fetchone()["cnt"]
+            msg_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM messages WHERE deleted_for_all = 0").fetchone()["cnt"]
+            if fts_cnt == 0 and msg_cnt > 0:
+                conn.execute(
+                    """
+                    INSERT INTO messages_fts(msg_id, room_id, sender, content, file_name)
+                    SELECT
+                        id,
+                        room_id,
+                        sender,
+                        CASE WHEN content LIKE 'E2EE:%' THEN '' ELSE content END,
+                        COALESCE(file_name, '')
+                    FROM messages
+                    WHERE deleted_for_all = 0
+                    """
+                )
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
 
 
@@ -274,6 +381,23 @@ class AuthRequest(BaseModel):
 
 class CreateGroupRequest(BaseModel):
     name: str
+    passcode: str = ""
+    announce_only: bool = False
+    disappear_seconds: int = 0
+
+
+class RoomJoinRequest(BaseModel):
+    passcode: str = ""
+
+
+class RoomSettingsRequest(BaseModel):
+    announce_only: bool | None = None
+    disappear_seconds: int | None = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    department: str = ""
+    status_text: str = ""
 
 
 class PublicKeyRequest(BaseModel):
@@ -294,13 +418,24 @@ def verify_token(token: str | None, request_ip: str) -> str:
         raise HTTPException(status_code=401, detail="Missing auth token.")
     with get_db() as conn:
         row = conn.execute(
-            "SELECT username, device_ip FROM users WHERE token = ?", (token,)
+            "SELECT username, device_ip, banned FROM users WHERE token = ?", (token,)
         ).fetchone()
     if not row:
         raise HTTPException(status_code=401, detail="Invalid or expired session.")
+    if row["banned"]:
+        raise HTTPException(status_code=403, detail="Your account has been suspended by an admin.")
     if request_ip not in LOCALHOST_IPS and row["device_ip"] and row["device_ip"] != request_ip:
         raise HTTPException(status_code=401, detail="Device IP changed. Please re-enter your PIN.")
     return row["username"]
+
+
+def require_admin(token: str | None, request_ip: str) -> str:
+    username = verify_token(token, request_ip)
+    with get_db() as conn:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+    if not row or row["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+    return username
 
 
 class ConnectionManager:
@@ -385,7 +520,7 @@ class ConnectionManager:
         def _fetch_users() -> list[sqlite3.Row]:
             with get_db() as conn:
                 return conn.execute(
-                    "SELECT username, public_key, last_seen FROM users ORDER BY username"
+                    "SELECT username, public_key, last_seen, department, status_text FROM users ORDER BY username"
                 ).fetchall()
 
         rows = await run_db(_fetch_users)
@@ -395,6 +530,8 @@ class ConnectionManager:
                 "online": row["username"] in self.active,
                 "public_key": row["public_key"],
                 "last_seen": row["last_seen"],
+                "department": row["department"],
+                "status_text": row["status_text"],
             }
             for row in rows
         ]
@@ -472,7 +609,7 @@ async def pwa_icon() -> Response:
 
 @app.get("/sw.js")
 async def pwa_service_worker() -> Response:
-    sw_js = '''const CACHE_NAME = "lan-chat-shell-v17";
+    sw_js = '''const CACHE_NAME = "lan-chat-shell-v19";
 const MEDIA_CACHE = "lan-chat-media-v1";
 const SHELL_URLS = ["/", "/manifest.json", "/icon.svg"];
 
@@ -571,8 +708,10 @@ async def authenticate(req: AuthRequest, request: Request) -> dict[str, Any]:
 
     with get_db() as conn:
         existing = conn.execute(
-            "SELECT username, pin_hash, device_ip FROM users WHERE username = ?", (username,)
+            "SELECT username, pin_hash, device_ip, role, banned FROM users WHERE username = ?", (username,)
         ).fetchone()
+        if existing and existing["banned"]:
+            raise HTTPException(status_code=403, detail="This account has been suspended by an admin.")
 
         if not is_local and ip:
             ip_owner = conn.execute(
@@ -600,23 +739,27 @@ async def authenticate(req: AuthRequest, request: Request) -> dict[str, Any]:
                     (token, ip, now, username),
                 )
             is_new = False
+            user_role = existing["role"] or "member"
         else:
             bound_ip = "" if is_local else ip
+            admin_exists = conn.execute("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").fetchone()
+            env_admins = {x.strip() for x in os.environ.get("LAN_CHAT_ADMINS", "").split(",") if x.strip()}
+            user_role = "admin" if (not admin_exists or username in env_admins) else "member"
             conn.execute(
                 """
-                INSERT INTO users (username, pin_hash, token, device_ip, last_seen)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (username, pin_hash, token, device_ip, role, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username) DO UPDATE SET
                     pin_hash = excluded.pin_hash,
                     token = excluded.token,
                     device_ip = excluded.device_ip,
                     last_seen = excluded.last_seen
                 """,
-                (username, hash_pin(pin), token, bound_ip, now),
+                (username, hash_pin(pin), token, bound_ip, user_role, now),
             )
             is_new = True
         conn.commit()
-    return {"username": username, "token": token, "is_new": is_new}
+    return {"username": username, "token": token, "is_new": is_new, "role": user_role}
 
 
 @app.post("/api/keys")
@@ -636,17 +779,63 @@ async def publish_public_key(
     return {"status": "ok"}
 
 
+@app.get("/api/config")
+async def get_brand_config() -> dict[str, str]:
+    return {
+        "brand_name": BRAND_NAME,
+        "brand_tagline": BRAND_TAGLINE,
+        "accent_color": BRAND_ACCENT,
+    }
+
+
+@app.post("/api/me/profile")
+async def update_my_profile(
+    req: ProfileUpdateRequest,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    username = verify_token(x_auth_token, get_client_ip(request))
+    dept = req.department.strip()[:32]
+    st = req.status_text.strip()[:48]
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET department = ?, status_text = ? WHERE username = ?",
+            (dept, st, username),
+        )
+        conn.commit()
+    await manager.broadcast_presence()
+    return {"ok": True, "department": dept, "status_text": st}
+
+
 @app.get("/api/rooms")
 async def list_rooms(
     request: Request,
     x_auth_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    verify_token(x_auth_token, get_client_ip(request))
+    username = verify_token(x_auth_token, get_client_ip(request))
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, name, is_group, created_by, created_at FROM rooms WHERE is_group = 1 ORDER BY created_at ASC"
+            "SELECT id, name, is_group, created_by, created_at, passcode_hash, announce_only, disappear_seconds FROM rooms WHERE is_group = 1 ORDER BY created_at ASC"
         ).fetchall()
-    return {"rooms": [dict(r) for r in rows]}
+        joined_set = {
+            r["room_id"]
+            for r in conn.execute("SELECT room_id FROM room_members WHERE username = ?", (username,)).fetchall()
+        }
+    rooms_out = []
+    for r in rows:
+        has_pass = bool(r["passcode_hash"])
+        rooms_out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "is_group": r["is_group"],
+            "created_by": r["created_by"],
+            "created_at": r["created_at"],
+            "has_passcode": has_pass,
+            "joined": (not has_pass) or (r["id"] in joined_set) or (r["created_by"] == username),
+            "announce_only": bool(r["announce_only"]),
+            "disappear_seconds": int(r["disappear_seconds"] or 0),
+        })
+    return {"rooms": rooms_out}
 
 
 @app.post("/api/rooms")
@@ -659,17 +848,91 @@ async def create_group(
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Group name is required.")
+    passcode = req.passcode.strip()
+    pass_hash = hash_pin(passcode) if passcode else ""
+    ann_only = 1 if req.announce_only else 0
+    disappear_sec = max(0, int(req.disappear_seconds or 0))
     room_id = f"group:{uuid.uuid4().hex[:8]}"
     created_at = utc_now_iso()
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO rooms (id, name, is_group, created_by, created_at) VALUES (?, ?, 1, ?, ?)",
-            (room_id, name, username, created_at),
+            "INSERT INTO rooms (id, name, is_group, created_by, created_at, passcode_hash, announce_only, disappear_seconds) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+            (room_id, name, username, created_at, pass_hash, ann_only, disappear_sec),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO room_members (room_id, username, joined_at) VALUES (?, ?, ?)",
+            (room_id, username, created_at),
         )
         conn.commit()
-    room = {"id": room_id, "name": name, "is_group": 1, "created_by": username, "created_at": created_at}
+    room = {
+        "id": room_id,
+        "name": name,
+        "is_group": 1,
+        "created_by": username,
+        "created_at": created_at,
+        "has_passcode": bool(pass_hash),
+        "joined": True,
+        "announce_only": bool(ann_only),
+        "disappear_seconds": disappear_sec,
+    }
     await manager.broadcast_all({"type": "room_created", "room": room})
     return {"room": room}
+
+
+@app.post("/api/rooms/{room_id}/join")
+async def join_protected_room(
+    room_id: str,
+    req: RoomJoinRequest,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    username = verify_token(x_auth_token, get_client_ip(request))
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, passcode_hash FROM rooms WHERE id = ?", (room_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Room not found.")
+        if row["passcode_hash"] and not verify_pin(req.passcode.strip(), row["passcode_hash"]):
+            raise HTTPException(status_code=403, detail="Incorrect room passcode.")
+        conn.execute(
+            "INSERT OR IGNORE INTO room_members (room_id, username, joined_at) VALUES (?, ?, ?)",
+            (room_id, username, utc_now_iso()),
+        )
+        conn.commit()
+    return {"ok": True, "room_id": room_id}
+
+
+@app.post("/api/rooms/{room_id}/settings")
+async def update_room_settings(
+    room_id: str,
+    req: RoomSettingsRequest,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    username = verify_token(x_auth_token, get_client_ip(request))
+    with get_db() as conn:
+        room = conn.execute("SELECT id, created_by, announce_only, disappear_seconds FROM rooms WHERE id = ?", (room_id,)).fetchone()
+        if not room:
+            raise HTTPException(status_code=404, detail="Room not found.")
+        u_row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        is_admin = bool(u_row and u_row["role"] == "admin")
+        if room["created_by"] != username and not is_admin:
+            raise HTTPException(status_code=403, detail="Only room creator or admin can change settings.")
+        ann = int(req.announce_only) if req.announce_only is not None else int(room["announce_only"] or 0)
+        dis = max(0, int(req.disappear_seconds)) if req.disappear_seconds is not None else int(room["disappear_seconds"] or 0)
+        conn.execute(
+            "UPDATE rooms SET announce_only = ?, disappear_seconds = ? WHERE id = ?",
+            (ann, dis, room_id),
+        )
+        conn.commit()
+    await manager.broadcast_all({
+        "type": "room_updated",
+        "room_id": room_id,
+        "announce_only": bool(ann),
+        "disappear_seconds": dis,
+    })
+    return {"ok": True, "room_id": room_id, "announce_only": bool(ann), "disappear_seconds": dis}
 
 
 @app.get("/api/rooms/{room_id}/keys")
@@ -796,7 +1059,7 @@ async def get_messages(
                    m.status, m.read_at, m.edited_at, m.deleted_for_all, m.pinned, m.thread_parent_id,
                    m.reply_to_id, m.reply_sender, m.reply_preview, m.created_at
             FROM messages m
-            WHERE m.room_id = ?
+            WHERE m.room_id = ? AND (m.expires_at IS NULL OR m.expires_at > datetime('now'))
               AND m.id > ?
               {upper_clause}
               AND NOT EXISTS (
@@ -1101,6 +1364,233 @@ def _offline_extractive_ai(
     )
 
 
+class AdminUserActionRequest(BaseModel):
+    action: str
+
+
+class AdminAnnounceRequest(BaseModel):
+    text: str
+    room_id: str = "group:general"
+
+
+@app.get("/api/me")
+async def get_my_profile(
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    username = verify_token(x_auth_token, get_client_ip(request))
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT username, role, device_ip, last_seen FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    return dict(row) if row else {"username": username, "role": "member"}
+
+
+@app.get("/api/search")
+async def search_messages_fts(
+    request: Request,
+    q: str = Query(default="", min_length=1),
+    room_id: str = Query(default=""),
+    limit: int = Query(default=30, ge=1, le=80),
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Full-Text Search powered by SQLite FTS5 across rooms, senders, and filenames."""
+    username = verify_token(x_auth_token, get_client_ip(request))
+    raw_q = q.strip()
+    tokens = re.findall(r"[a-zA-Z0-9_]+", raw_q)
+    if not tokens:
+        return {"results": []}
+    fts_expr = " ".join(f'"{t}"*' for t in tokens[:6])
+
+    def _run_fts() -> list[dict[str, Any]]:
+        with get_db() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT f.msg_id AS id, f.room_id, f.sender, f.content, f.file_name, m.created_at
+                    FROM messages_fts f
+                    JOIN messages m ON m.id = f.msg_id
+                    WHERE messages_fts MATCH ? AND m.deleted_for_all = 0
+                    ORDER BY bm25(messages_fts), m.id DESC
+                    LIMIT ?
+                    """,
+                    (fts_expr, limit * 2),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                like_pat = f"%{raw_q}%"
+                rows = conn.execute(
+                    """
+                    SELECT id, room_id, sender, content, file_name, created_at
+                    FROM messages
+                    WHERE deleted_for_all = 0
+                      AND (
+                        (content NOT LIKE 'E2EE:%' AND content LIKE ?)
+                        OR sender LIKE ?
+                        OR COALESCE(file_name, '') LIKE ?
+                      )
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (like_pat, like_pat, like_pat, limit * 2),
+                ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for r in rows:
+            rid = r["room_id"]
+            if room_id and rid != room_id:
+                continue
+            targets = room_targets(rid)
+            if targets is not None and username not in targets:
+                continue
+            results.append(dict(r))
+            if len(results) >= limit:
+                break
+        return results
+
+    results = await run_db(_run_fts)
+    return {"results": results, "query": raw_q}
+
+
+@app.get("/api/admin/overview")
+async def admin_overview(
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_admin(x_auth_token, get_client_ip(request))
+
+    def _gather() -> dict[str, Any]:
+        with get_db() as conn:
+            u_rows = conn.execute(
+                "SELECT username, role, device_ip, banned, last_seen FROM users ORDER BY role ASC, username ASC"
+            ).fetchall()
+            msg_count = conn.execute("SELECT COUNT(*) AS cnt FROM messages WHERE deleted_for_all = 0").fetchone()["cnt"]
+            room_count = conn.execute("SELECT COUNT(*) AS cnt FROM rooms").fetchone()["cnt"]
+        upload_files = list(UPLOAD_DIR.iterdir()) if UPLOAD_DIR.exists() else []
+        upload_bytes = sum(f.stat().st_size for f in upload_files if f.is_file())
+        users_list = []
+        for r in u_rows:
+            d = dict(r)
+            d["online"] = r["username"] in manager.active
+            users_list.append(d)
+        return {
+            "stats": {
+                "total_users": len(users_list),
+                "online_users": len(manager.active),
+                "total_messages": msg_count,
+                "total_rooms": room_count,
+                "uploads_count": len(upload_files),
+                "uploads_mb": round(upload_bytes / (1024 * 1024), 2),
+                "retention_days": UPLOAD_RETENTION_DAYS,
+            },
+            "users": users_list,
+        }
+
+    return await run_db(_gather)
+
+
+@app.post("/api/admin/users/{target_user}/action")
+async def admin_user_action(
+    target_user: str,
+    req: AdminUserActionRequest,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    admin_user = require_admin(x_auth_token, get_client_ip(request))
+    act = req.action.strip().lower()
+    if target_user == admin_user and act in ("ban", "demote"):
+        raise HTTPException(status_code=400, detail="You cannot ban or demote yourself.")
+
+    with get_db() as conn:
+        row = conn.execute("SELECT username FROM users WHERE username = ?", (target_user,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found.")
+        if act == "promote":
+            conn.execute("UPDATE users SET role = 'admin' WHERE username = ?", (target_user,))
+        elif act == "demote":
+            conn.execute("UPDATE users SET role = 'member' WHERE username = ?", (target_user,))
+        elif act == "ban":
+            conn.execute("UPDATE users SET banned = 1, token = '' WHERE username = ?", (target_user,))
+        elif act == "unban":
+            conn.execute("UPDATE users SET banned = 0 WHERE username = ?", (target_user,))
+        elif act == "clear_ip":
+            conn.execute("UPDATE users SET device_ip = '' WHERE username = ?", (target_user,))
+        else:
+            raise HTTPException(status_code=400, detail="Unknown action.")
+        conn.commit()
+
+    if act == "ban":
+        for ws in list(manager.active.get(target_user, set())):
+            try:
+                await ws.close(code=1008)
+            except Exception:
+                pass
+            manager.disconnect(target_user, ws)
+        await manager.broadcast_presence()
+
+    return {"ok": True, "username": target_user, "action": act}
+
+
+@app.post("/api/admin/cleanup")
+async def admin_cleanup_uploads(
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_admin(x_auth_token, get_client_ip(request))
+    removed = await run_db(cleanup_old_uploads, UPLOAD_RETENTION_DAYS)
+    return {"ok": True, "removed": removed}
+
+
+@app.post("/api/admin/announce")
+async def admin_announce(
+    req: AdminAnnounceRequest,
+    request: Request,
+    x_auth_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    admin_user = require_admin(x_auth_token, get_client_ip(request))
+    clean_text = req.text.strip()
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="Announcement text is required.")
+    room_id = req.room_id.strip() or "group:general"
+    created_at = utc_now_iso()
+    full_text = f"📢 **[ADMIN ANNOUNCEMENT — {admin_user}]**\n{clean_text}"
+
+    def _insert() -> int:
+        with get_db() as conn:
+            cur = conn.execute(
+                "INSERT INTO messages (room_id, sender, content, msg_type, status, created_at) VALUES (?, ?, ?, 'text', 'delivered', ?)",
+                (room_id, f"🛡️ {admin_user}", full_text, created_at),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    msg_id = await run_db(_insert)
+    ev = {
+        "type": "message",
+        "message": {
+            "id": msg_id,
+            "room_id": room_id,
+            "sender": f"🛡️ {admin_user}",
+            "content": full_text,
+            "msg_type": "text",
+            "file_name": None,
+            "file_url": None,
+            "status": "delivered",
+            "reply_to_id": None,
+            "reply_sender": None,
+            "reply_preview": None,
+            "thread_parent_id": None,
+            "parent_thread_count": 0,
+            "thread_count": 0,
+            "pinned": 0,
+            "reactions": {},
+            "poll_votes": {},
+            "created_at": created_at,
+        },
+    }
+    await manager.broadcast_all(ev)
+    return {"ok": True, "id": msg_id}
+
+
 @app.post("/api/ai")
 async def run_local_ai(
     payload: AIRequest,
@@ -1315,10 +1805,10 @@ async def websocket_endpoint(
     is_local = ip in LOCALHOST_IPS
     with get_db() as conn:
         row = conn.execute(
-            "SELECT username, device_ip FROM users WHERE username = ? AND token = ?",
+            "SELECT username, device_ip, banned FROM users WHERE username = ? AND token = ?",
             (clean_user, token),
         ).fetchone()
-    if not row:
+    if not row or row["banned"]:
         await websocket.close(code=1008)
         return
     if not is_local and row["device_ip"] and row["device_ip"] != ip:
@@ -1674,6 +2164,23 @@ async def websocket_endpoint(
                 if not content and not file_url:
                     continue
 
+                room_meta_row = None
+                if room_id.startswith("group:"):
+                    with get_db() as conn:
+                        room_meta_row = conn.execute(
+                            "SELECT created_by, announce_only, disappear_seconds FROM rooms WHERE id = ?",
+                            (room_id,),
+                        ).fetchone()
+                        if room_meta_row and room_meta_row["announce_only"]:
+                            u_r = conn.execute("SELECT role FROM users WHERE username = ?", (clean_user,)).fetchone()
+                            is_adm = bool(u_r and u_r["role"] == "admin")
+                            if clean_user != room_meta_row["created_by"] and not is_adm:
+                                await manager.send_to_user(
+                                    clean_user,
+                                    {"type": "error", "detail": "This is an announcement-only channel. Only admins or the creator can post."},
+                                )
+                                continue
+
                 if targets is not None:
                     other_online = any(t != clean_user and t in manager.active for t in targets)
                 else:
@@ -1681,19 +2188,25 @@ async def websocket_endpoint(
                 initial_status = "delivered" if other_online else "sent"
 
                 created_at = utc_now_iso()
+                dis_sec = int(room_meta_row["disappear_seconds"] or 0) if room_meta_row else 0
+                expires_at = (
+                    (datetime.now(timezone.utc) + timedelta(seconds=dis_sec)).strftime("%Y-%m-%d %H:%M:%S")
+                    if dis_sec > 0
+                    else None
+                )
                 def _do_insert_msg() -> tuple[int, int]:
                     with get_db() as conn:
                         cur = conn.execute(
                             """
                             INSERT INTO messages (
                                 room_id, sender, content, msg_type, file_name, file_url,
-                                status, reply_to_id, reply_sender, reply_preview, thread_parent_id, created_at
+                                status, reply_to_id, reply_sender, reply_preview, thread_parent_id, expires_at, created_at
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 room_id, clean_user, content, msg_type, file_name, file_url,
-                                initial_status, reply_to_id, reply_sender, reply_preview, thread_parent_id, created_at,
+                                initial_status, reply_to_id, reply_sender, reply_preview, thread_parent_id, expires_at, created_at,
                             ),
                         )
                         t_cnt = 0
@@ -2387,8 +2900,14 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
         <div class="user-badge">
           <div class="avatar-circle" id="me-avatar">U<span class="status-dot"></span></div>
           <span id="me-label"></span>
+          <button type="button" class="icon-btn" id="edit-profile-btn" title="Set Department & Custom Status" style="width:24px;height:24px;padding:2px;margin-left:2px;">
+            <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          </button>
         </div>
         <div class="top-action-row">
+          <button class="pill-icon-btn" id="admin-btn" title="Admin Dashboard" style="display:none;">
+            <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </button>
           <button class="pill-icon-btn" id="invite-btn" title="Invite via Hotspot / Wi-Fi (QR)">
             <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/></svg>
           </button>
@@ -2451,17 +2970,28 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
           <button type="button" class="icon-btn" id="clear-chat-btn" title="Clear Chat">
             <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
           </button>
+          <button type="button" class="icon-btn" id="verify-e2ee-btn" title="Verify E2EE Safety Number" style="display:none;">
+            <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="room-settings-btn" title="Room Settings (Announcement-only & Disappearing Timer)" style="display:none;">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="export-chat-btn" title="Export Decrypted Chat (.txt / .json)">
+            <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
           <button type="button" class="icon-btn" id="sound-toggle-btn" title="Sound: On"></button>
         </div>
       </div>
 
       <div id="msg-search-bar">
-        <input type="text" id="msg-search-input" placeholder="Search messages, sender, or filenames in this room..." autocomplete="off" />
+        <input type="text" id="msg-search-input" placeholder="Search messages, sender, or filenames..." autocomplete="off" />
+        <button type="button" class="pill-icon-btn" id="msg-search-global-btn" title="Search across all rooms via SQLite FTS5" style="padding:4px 9px;font-size:0.74rem;">🌐 FTS5</button>
         <span class="search-count" id="msg-search-count">0 / 0</span>
         <button type="button" class="icon-btn" id="msg-search-prev" title="Previous match">↑</button>
         <button type="button" class="icon-btn" id="msg-search-next" title="Next match">↓</button>
         <button type="button" class="icon-btn" id="msg-search-close" title="Close search">×</button>
       </div>
+      <div id="global-search-results" style="display:none;max-height:220px;overflow-y:auto;background:var(--panel);border-bottom:1px solid var(--border);padding:8px 16px;font-size:0.82rem;"></div>
 
       <div id="pinned-banner">
         <div class="pinned-banner-left" id="pinned-banner-jump" title="Click to jump to pinned message">
@@ -2648,6 +3178,62 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+
+  
+  <div id="new-group-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card" style="max-width:420px;width:92%;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <h3 style="margin:0;font-size:1.05rem;">Create Group / Channel</h3>
+        <button type="button" class="icon-btn" id="new-group-close-btn">✕</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <input type="text" id="ng-name" placeholder="Group or Channel name (e.g. #CSE-Project)" style="padding:9px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);" />
+        <input type="password" id="ng-passcode" placeholder="Optional Passcode (leave blank for open)" style="padding:9px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);" />
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.85rem;cursor:pointer;">
+          <input type="checkbox" id="ng-announce" /> Announcement-Only Channel (only admins/creator can post)
+        </label>
+        <label style="font-size:0.82rem;color:var(--muted);">
+          Disappearing Messages:
+          <select id="ng-disappear" style="margin-left:6px;padding:5px 8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);">
+            <option value="0">Off</option>
+            <option value="60">1 minute</option>
+            <option value="3600">1 hour</option>
+            <option value="86400">24 hours</option>
+          </select>
+        </label>
+        <button type="button" class="btn-primary" id="ng-create-btn" style="padding:10px;border-radius:10px;">Create Group</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="admin-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card" style="max-width:680px;width:94%;max-height:86vh;display:flex;flex-direction:column;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <h3 style="margin:0;font-size:1.05rem;">🛡️ Admin Control Center</h3>
+        <button type="button" class="icon-btn" id="admin-close-btn" title="Close">✕</button>
+      </div>
+      <div id="admin-stats-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+        <input type="text" id="admin-announce-input" placeholder="Broadcast announcement to #General..." style="flex:1;min-width:180px;padding:8px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.85rem;" />
+        <button type="button" class="btn-primary" id="admin-announce-btn" style="padding:8px 14px;border-radius:10px;font-size:0.84rem;">📢 Announce</button>
+        <button type="button" class="pill-icon-btn" id="admin-cleanup-btn" style="padding:8px 12px;font-size:0.82rem;">🧹 Run 7d Cleanup</button>
+      </div>
+      <div style="overflow-y:auto;flex:1;border:1px solid var(--border);border-radius:10px;">
+        <table style="width:100%;border-collapse:collapse;font-size:0.8rem;">
+          <thead>
+            <tr style="background:var(--bg);text-align:left;border-bottom:1px solid var(--border);">
+              <th style="padding:8px 10px;">User</th>
+              <th style="padding:8px 10px;">Role</th>
+              <th style="padding:8px 10px;">Device IP</th>
+              <th style="padding:8px 10px;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="admin-users-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <script>
     let me = "";
     let authToken = "";
@@ -2658,15 +3244,73 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
     let roomMessages = [];
     const roomCache = {};
 
+    const lanChatIDB = (() => {
+      let dbPromise = null;
+      function openDB() {
+        if (dbPromise) return dbPromise;
+        dbPromise = new Promise((resolve) => {
+          if (!("indexedDB" in window)) return resolve(null);
+          const req = indexedDB.open("lan_chat_idb_v1", 1);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains("rooms_history")) db.createObjectStore("rooms_history");
+            if (!db.objectStoreNames.contains("media_outbox")) db.createObjectStore("media_outbox", { keyPath: "id" });
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => resolve(null);
+        });
+        return dbPromise;
+      }
+      async function putHistory(key, msgs) {
+        const db = await openDB();
+        if (!db) return;
+        const tx = db.transaction("rooms_history", "readwrite");
+        tx.objectStore("rooms_history").put(msgs, key);
+      }
+      async function getHistory(key) {
+        const db = await openDB();
+        if (!db) return null;
+        return new Promise((resolve) => {
+          const tx = db.transaction("rooms_history", "readonly");
+          const req = tx.objectStore("rooms_history").get(key);
+          req.onsuccess = () => resolve(req.result || null);
+          req.onerror = () => resolve(null);
+        });
+      }
+      async function addMediaOutbox(item) {
+        const db = await openDB();
+        if (!db) return;
+        const tx = db.transaction("media_outbox", "readwrite");
+        tx.objectStore("media_outbox").put(item);
+      }
+      async function listMediaOutbox(username) {
+        const db = await openDB();
+        if (!db) return [];
+        return new Promise((resolve) => {
+          const tx = db.transaction("media_outbox", "readonly");
+          const req = tx.objectStore("media_outbox").getAll();
+          req.onsuccess = () => resolve((req.result || []).filter(x => x.username === username));
+          req.onerror = () => resolve([]);
+        });
+      }
+      async function removeMediaOutbox(id) {
+        const db = await openDB();
+        if (!db) return;
+        const tx = db.transaction("media_outbox", "readwrite");
+        tx.objectStore("media_outbox").delete(id);
+      }
+      return { putHistory, getHistory, addMediaOutbox, listMediaOutbox, removeMediaOutbox };
+    })();
+
     function saveRoomCache(roomId, msgs) {
-      roomCache[roomId] = msgs.slice(-100);
+      roomCache[roomId] = msgs.slice(-150);
+      const serializable = roomCache[roomId].map(m => ({
+        ...m,
+        file_url: m.orig_file_url || m.file_url,
+      }));
+      lanChatIDB.putHistory(`${me}_${roomId}`, serializable).catch(() => {});
       try {
-        // Persist decrypted text/metadata (strip transient blob: URLs so they re-resolve cleanly)
-        const serializable = roomCache[roomId].map(m => ({
-          ...m,
-          file_url: m.orig_file_url || m.file_url,
-        }));
-        localStorage.setItem(`lan_chat_cache_${me}_${roomId}`, JSON.stringify(serializable));
+        localStorage.setItem(`lan_chat_cache_${me}_${roomId}`, JSON.stringify(serializable.slice(-60)));
       } catch {}
     }
 
@@ -3049,6 +3693,25 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
       activeRoom = room;
       if (openMobileChat) appEl.classList.add("chat-open");
       unread[room.id] = 0;
+      if (room.isGroup && room.has_passcode && !room.joined) {
+        const codeInput = prompt(`🔒 "${room.name}" is passcode-protected. Enter passcode to join:`);
+        if (codeInput === null) return;
+        const jRes = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/join`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ passcode: codeInput })
+        });
+        if (!jRes.ok) {
+          const jd = await jRes.json().catch(() => ({}));
+          alert(jd.detail || "Incorrect passcode.");
+          return;
+        }
+        room.joined = true;
+      }
+      const vBtn = document.getElementById("verify-e2ee-btn");
+      if (vBtn) vBtn.style.display = room.isGroup ? "none" : "inline-flex";
+      const rsBtn = document.getElementById("room-settings-btn");
+      if (rsBtn) rsBtn.style.display = room.isGroup ? "inline-flex" : "none";
       document.getElementById("active-room-title").textContent = room.name;
       document.getElementById("header-avatar").textContent = (room.name[0] || "C").toUpperCase();
       const roomKey = await getRoomAesKey(room.id);
@@ -3642,13 +4305,36 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
       localStorage.setItem(outboxKey(), JSON.stringify(items));
     }
 
-    function flushOutbox() {
+    async function flushOutbox() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const items = loadOutbox();
-      if (items.length === 0) return;
-      saveOutbox([]);
-      document.querySelectorAll(".msg-row[data-queued='1']").forEach(el => el.remove());
-      items.forEach(item => ws.send(JSON.stringify(item)));
+      if (items.length > 0) {
+        saveOutbox([]);
+        document.querySelectorAll(".msg-row[data-queued='1']").forEach(el => el.remove());
+        items.forEach(item => ws.send(JSON.stringify(item)));
+      }
+      const mediaItems = await lanChatIDB.listMediaOutbox(me);
+      for (const mItem of mediaItems) {
+        try {
+          const prevRoom = activeRoom;
+          activeRoom = { id: mItem.room_id, peer: mItem.peer };
+          const upRes = await uploadEncryptedOrPlain(mItem.blob, mItem.filename);
+          activeRoom = prevRoom;
+          if (upRes.ok && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "message",
+              room_id: mItem.room_id,
+              peer: mItem.peer,
+              content: "",
+              msg_type: upRes.data.msg_type,
+              file_name: upRes.data.file_name,
+              file_url: upRes.data.file_url,
+            }));
+            await lanChatIDB.removeMediaOutbox(mItem.id);
+            document.querySelectorAll(`.msg-row[data-queued-media='${mItem.id}']`).forEach(el => el.remove());
+          }
+        } catch {}
+      }
     }
 
     function connectWS() {
@@ -3806,6 +4492,7 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
       if ("Notification" in window && Notification.permission === "default") {
         Notification.requestPermission().catch(() => {});
       }
+      await refreshMyProfile();
       await ensureE2EEKeys();
       await loadRooms();
       const joinId = new URLSearchParams(location.search).get("join");
@@ -4125,14 +4812,28 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
       loginScreen.style.display = "flex";
     };
 
-    document.getElementById("new-group-btn").onclick = async () => {
-      const name = prompt("New group name:");
-      if (!name || !name.trim()) return;
+    const newGroupModal = document.getElementById("new-group-modal");
+    document.getElementById("new-group-btn").onclick = () => {
+      document.getElementById("ng-name").value = "";
+      document.getElementById("ng-passcode").value = "";
+      document.getElementById("ng-announce").checked = false;
+      document.getElementById("ng-disappear").value = "0";
+      newGroupModal.style.display = "flex";
+      document.getElementById("ng-name").focus();
+    };
+    document.getElementById("new-group-close-btn").onclick = () => { newGroupModal.style.display = "none"; };
+    document.getElementById("ng-create-btn").onclick = async () => {
+      const name = document.getElementById("ng-name").value.trim();
+      if (!name) return alert("Group name is required.");
+      const passcode = document.getElementById("ng-passcode").value.trim();
+      const announce_only = document.getElementById("ng-announce").checked;
+      const disappear_seconds = parseInt(document.getElementById("ng-disappear").value || "0", 10);
       await fetch("/api/rooms", {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ name: name.trim() }),
+        body: JSON.stringify({ name, passcode, announce_only, disappear_seconds }),
       });
+      newGroupModal.style.display = "none";
     };
 
     let activeThreadParent = null;
@@ -4525,10 +5226,54 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
 
     async function uploadAndSendFile(file) {
       if (!file) return;
-      const res = await uploadEncryptedOrPlain(file, file.name || "attachment");
+      const fname = file.name || "attachment";
+      const isOnline = ws && ws.readyState === WebSocket.OPEN;
+      if (!isOnline) {
+        const qId = "m_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+        await lanChatIDB.addMediaOutbox({
+          id: qId,
+          username: me,
+          room_id: activeRoom.id,
+          peer: activeRoom.peer || null,
+          filename: fname,
+          blob: file
+        });
+        appendMessage({
+          id: Date.now(),
+          room_id: activeRoom.id,
+          sender: me,
+          content: `⏳ Queued offline (IndexedDB): ${fname}`,
+          msg_type: "text",
+          status: "queued",
+          created_at: new Date().toISOString().replace("T", " ").slice(0, 19),
+        });
+        const lastRow = messagesEl.lastElementChild;
+        if (lastRow) lastRow.dataset.queuedMedia = qId;
+        return;
+      }
+      const res = await uploadEncryptedOrPlain(file, fname);
       const uploaded = res.data;
       if (!res.ok) {
-        alert(uploaded.detail || "Upload failed.");
+        const qId = "m_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+        await lanChatIDB.addMediaOutbox({
+          id: qId,
+          username: me,
+          room_id: activeRoom.id,
+          peer: activeRoom.peer || null,
+          filename: fname,
+          blob: file
+        });
+        appendMessage({
+          id: Date.now(),
+          room_id: activeRoom.id,
+          sender: me,
+          content: `⏳ Upload queued offline: ${fname}`,
+          msg_type: "text",
+          status: "queued",
+          created_at: new Date().toISOString().replace("T", " ").slice(0, 19),
+        });
+        const lastRow = messagesEl.lastElementChild;
+        if (lastRow) lastRow.dataset.queuedMedia = qId;
         return;
       }
       ws.send(JSON.stringify({
@@ -5455,6 +6200,237 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
         localStorage.removeItem("lan_chat_auth");
       }
     })();
+
+    let myRole = "member";
+    async function refreshMyProfile() {
+      try {
+        const res = await fetch("/api/me", { headers: authHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          myRole = data.role || "member";
+          const adminBtn = document.getElementById("admin-btn");
+          if (adminBtn) adminBtn.style.display = myRole === "admin" ? "inline-flex" : "none";
+        }
+      } catch {}
+    }
+
+    const globalSearchBox = document.getElementById("global-search-results");
+    document.getElementById("msg-search-global-btn").onclick = async () => {
+      const q = document.getElementById("msg-search-input").value.trim();
+      if (!q) {
+        globalSearchBox.style.display = "none";
+        return;
+      }
+      globalSearchBox.style.display = "block";
+      globalSearchBox.innerHTML = `<div style="color:var(--muted);">Searching across all rooms (SQLite FTS5)...</div>`;
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { headers: authHeaders() });
+        const data = await res.json();
+        const items = data.results || [];
+        if (items.length === 0) {
+          globalSearchBox.innerHTML = `<div style="color:var(--muted);">No server-side FTS5 matches (note: E2EE message text is searched locally in-room).</div>`;
+          return;
+        }
+        globalSearchBox.innerHTML = `<div style="font-weight:700;margin-bottom:6px;color:var(--accent);">🌐 Global FTS5 Matches (${items.length})</div>` +
+          items.map(it => {
+            const label = it.content || (it.file_name ? `📎 ${it.file_name}` : "Encrypted message");
+            return `<div class="notif-item" style="cursor:pointer;padding:6px 8px;border-radius:8px;" onclick="jumpToSearchRoom('${escapeHtml(it.room_id)}', ${it.id})">` +
+              `<div style="font-weight:700;font-size:0.76rem;">${escapeHtml(it.room_id)} • ${escapeHtml(it.sender)} <span style="color:var(--muted);font-weight:400;">${escapeHtml((it.created_at || "").slice(0, 16))}</span></div>` +
+              `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(label)}</div>` +
+            `</div>`;
+          }).join("");
+      } catch {
+        globalSearchBox.innerHTML = `<div style="color:var(--error);">FTS5 search failed.</div>`;
+      }
+    };
+
+    window.jumpToSearchRoom = async (roomId, msgId) => {
+      globalSearchBox.style.display = "none";
+      const found = rooms.find(r => r.id === roomId);
+      if (found) {
+        await selectRoom(found);
+        const el = document.querySelector(`.msg-row[data-id='${msgId}']`);
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    };
+
+    document.getElementById("msg-search-close").addEventListener("click", () => {
+      if (globalSearchBox) globalSearchBox.style.display = "none";
+    });
+
+    const adminModal = document.getElementById("admin-modal");
+    async function loadAdminOverview() {
+      const statsEl = document.getElementById("admin-stats-grid");
+      const tbodyEl = document.getElementById("admin-users-tbody");
+      statsEl.innerHTML = `<div style="color:var(--muted);font-size:0.82rem;">Loading stats...</div>`;
+      tbodyEl.innerHTML = "";
+      try {
+        const res = await fetch("/api/admin/overview", { headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok) {
+          statsEl.innerHTML = `<div style="color:var(--error);">${escapeHtml(data.detail || "Access denied.")}</div>`;
+          return;
+        }
+        const s = data.stats || {};
+        const statCards = [
+          ["Users", `${s.online_users || 0} / ${s.total_users || 0} online`],
+          ["Messages", `${s.total_messages || 0}`],
+          ["Rooms", `${s.total_rooms || 0}`],
+          ["Uploads", `${s.uploads_count || 0} (${s.uploads_mb || 0} MB)`],
+        ];
+        statsEl.innerHTML = statCards.map(([k, v]) =>
+          `<div style="background:var(--bg);padding:8px 10px;border-radius:10px;border:1px solid var(--border);">` +
+            `<div style="font-size:0.7rem;color:var(--muted);">${k}</div>` +
+            `<div style="font-weight:700;font-size:0.9rem;">${v}</div>` +
+          `</div>`
+        ).join("");
+        tbodyEl.innerHTML = (data.users || []).map(u => {
+          const isSelf = u.username === me;
+          const badge = u.banned ? `<span style="color:var(--error);font-weight:700;">BANNED</span>` :
+            (u.role === "admin" ? `<span style="color:var(--accent);font-weight:700;">admin</span>` : `member`);
+          const dot = u.online ? "🟢" : "⚪";
+          return `<tr style="border-bottom:1px solid var(--border);">` +
+            `<td style="padding:7px 10px;">${dot} <strong>${escapeHtml(u.username)}</strong></td>` +
+            `<td style="padding:7px 10px;">${badge}</td>` +
+            `<td style="padding:7px 10px;font-family:monospace;font-size:0.75rem;">${escapeHtml(u.device_ip || "—")}</td>` +
+            `<td style="padding:7px 10px;display:flex;gap:4px;flex-wrap:wrap;">` +
+              (!isSelf ? `<button class="pill-icon-btn" style="padding:2px 7px;font-size:0.72rem;" onclick="adminUserAct('${escapeHtml(u.username)}', '${u.role === "admin" ? "demote" : "promote"}')">${u.role === "admin" ? "Demote" : "Make Admin"}</button>` : "") +
+              `<button class="pill-icon-btn" style="padding:2px 7px;font-size:0.72rem;" onclick="adminUserAct('${escapeHtml(u.username)}', 'clear_ip')">Clear IP</button>` +
+              (!isSelf ? `<button class="pill-icon-btn" style="padding:2px 7px;font-size:0.72rem;color:${u.banned ? "var(--accent)" : "var(--error)"};" onclick="adminUserAct('${escapeHtml(u.username)}', '${u.banned ? "unban" : "ban"}')">${u.banned ? "Unban" : "Ban"}</button>` : "") +
+            `</td></tr>`;
+        }).join("");
+      } catch {
+        statsEl.innerHTML = `<div style="color:var(--error);">Failed to load admin overview.</div>`;
+      }
+    }
+
+    window.adminUserAct = async (targetUser, action) => {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(targetUser)}/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ action })
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert(d.detail || "Action failed.");
+      }
+      await loadAdminOverview();
+    };
+
+    document.getElementById("admin-btn").onclick = async () => {
+      adminModal.style.display = "flex";
+      await loadAdminOverview();
+    };
+    document.getElementById("admin-close-btn").onclick = () => { adminModal.style.display = "none"; };
+    document.getElementById("admin-cleanup-btn").onclick = async () => {
+      const res = await fetch("/api/admin/cleanup", { method: "POST", headers: authHeaders() });
+      const d = await res.json().catch(() => ({}));
+      alert(`Cleanup complete: ${d.removed || 0} expired file(s) removed.`);
+      await loadAdminOverview();
+    };
+    document.getElementById("admin-announce-btn").onclick = async () => {
+      const inp = document.getElementById("admin-announce-input");
+      const txt = inp.value.trim();
+      if (!txt) return;
+      const res = await fetch("/api/admin/announce", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ text: txt, room_id: "group:general" })
+      });
+      if (res.ok) {
+        inp.value = "";
+        adminModal.style.display = "none";
+      }
+    };
+
+
+    // White-label branding loader
+    fetch("/api/config").then(r => r.json()).then(cfg => {
+      if (cfg.brand_name) {
+        document.title = cfg.brand_name;
+        const h1 = document.querySelector("#login-screen h1");
+        if (h1) h1.textContent = cfg.brand_name;
+      }
+      if (cfg.brand_tagline) {
+        const sub = document.querySelector("#login-screen .login-card p");
+        if (sub) sub.textContent = cfg.brand_tagline;
+      }
+      if (cfg.accent_color) {
+        document.documentElement.style.setProperty("--accent", cfg.accent_color);
+      }
+    }).catch(() => {});
+
+    document.getElementById("edit-profile-btn").onclick = async () => {
+      const meObj = (users || []).find(u => u.username === me) || {};
+      const dept = prompt("Department / Team tag (e.g. Engineering, CSE-4A):", meObj.department || "");
+      if (dept === null) return;
+      const statusText = prompt("Custom Status (e.g. In Lab, WFH, Busy):", meObj.status_text || "");
+      if (statusText === null) return;
+      await fetch("/api/me/profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ department: dept, status_text: statusText })
+      });
+    };
+
+    document.getElementById("export-chat-btn").onclick = () => {
+      const msgs = roomMessages || [];
+      if (msgs.length === 0) return alert("No messages in this room to export.");
+      const asJson = confirm("Click OK to export as .JSON, or Cancel to export as .TXT");
+      const safeName = (activeRoom.name || activeRoom.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+      let blob, ext;
+      if (asJson) {
+        blob = new Blob([JSON.stringify(msgs, null, 2)], { type: "application/json" });
+        ext = "json";
+      } else {
+        const lines = msgs.map(m => `[${m.created_at || ""}] ${m.sender}: ${m.content || (m.file_name ? "[File: " + m.file_name + "]" : "")}`);
+        blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
+        ext = "txt";
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${safeName}_export.${ext}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    };
+
+    document.getElementById("verify-e2ee-btn").onclick = async () => {
+      if (!activeRoom || activeRoom.isGroup || !activeRoom.peer) return;
+      const meObj = (users || []).find(u => u.username === me);
+      const peerObj = (users || []).find(u => u.username === activeRoom.peer);
+      if (!meObj?.public_key || !peerObj?.public_key) {
+        return alert("Both users must have active E2EE keys to compute a Safety Number.");
+      }
+      const sorted = [meObj.public_key, peerObj.public_key].sort().join("|");
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sorted));
+      const bytes = Array.from(new Uint8Array(digest));
+      const blocks = [];
+      for (let i = 0; i < 12; i += 2) {
+        const num = ((bytes[i] << 8) | bytes[i + 1]) % 100000;
+        blocks.push(String(num).padStart(5, "0"));
+      }
+      alert(`🔐 E2EE Safety Number with ${activeRoom.peer}:\n\n${blocks.slice(0, 3).join("  ")}\n${blocks.slice(3, 6).join("  ")}\n\nCompare these 6 blocks with ${activeRoom.peer} in person to verify zero MITM.`);
+    };
+
+    document.getElementById("room-settings-btn").onclick = async () => {
+      if (!activeRoom || !activeRoom.isGroup) return;
+      const rObj = (rooms || []).find(r => r.id === activeRoom.id) || {};
+      const nextAnn = confirm(`Announcement-Only Mode is currently ${rObj.announce_only ? "ON" : "OFF"}.\n\nClick OK to enable Announcement-Only, or Cancel to turn it OFF.`);
+      const disStr = prompt("Disappearing messages timer in seconds (0 = Off, 60 = 1m, 3600 = 1h, 86400 = 24h):", String(rObj.disappear_seconds || 0));
+      if (disStr === null) return;
+      const res = await fetch(`/api/rooms/${encodeURIComponent(activeRoom.id)}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ announce_only: nextAnn, disappear_seconds: parseInt(disStr, 10) || 0 })
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert(d.detail || "Only room creator or admin can update settings.");
+      } else {
+        await loadRooms();
+      }
+    };
+
   </script>
 </body>
 </html>

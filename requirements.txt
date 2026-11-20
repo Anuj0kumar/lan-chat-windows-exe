@@ -5,3 +5,5 @@ websockets
 qrcode
 zeroconf
 cryptography
+httpx
+pytest

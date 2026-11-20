@@ -9,7 +9,7 @@ pyinstaller --onefile --name "LAN-Chat" ^
   --hidden-import=uvicorn.protocols.http.auto ^
   --hidden-import=uvicorn.protocols.websockets.auto ^
   --hidden-import=uvicorn.lifespan.on ^
-  --hidden-import=zeroconf ^
+  --collect-all=zeroconf --collect-all=ifaddr ^
   --hidden-import=qrcode ^
   --hidden-import=cryptography ^
   lan_chat_app.py

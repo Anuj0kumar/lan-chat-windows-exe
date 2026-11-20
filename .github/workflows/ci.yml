@@ -1,0 +1,51 @@
+name: LAN Chat CI & Windows EXE Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run automated test suite
+        run: pytest test_lan_chat.py -v
+
+  build-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies & PyInstaller
+        run: pip install pyinstaller -r requirements.txt
+      - name: Build LAN-Chat.exe
+        run: |
+          pyinstaller --onefile --name "LAN-Chat" ^
+            --hidden-import=uvicorn.logging ^
+            --hidden-import=uvicorn.loops.auto ^
+            --hidden-import=uvicorn.protocols.http.auto ^
+            --hidden-import=uvicorn.protocols.websockets.auto ^
+            --hidden-import=uvicorn.lifespan.on ^
+            --collect-all=zeroconf --collect-all=ifaddr ^
+            --hidden-import=qrcode ^
+            --hidden-import=cryptography ^
+            lan_chat_app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LAN-Chat-Windows-EXE
+          path: dist/LAN-Chat.exe
