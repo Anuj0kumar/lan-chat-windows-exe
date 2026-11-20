@@ -44,7 +44,7 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]{2,24}$")
 PIN_RE = re.compile(r"^\d{4,8}$")
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
-BRAND_NAME = os.environ.get("LAN_CHAT_BRAND_NAME", "LAN Chat").strip() or "LAN Chat"
+BRAND_NAME = os.environ.get("LAN_CHAT_BRAND_NAME", "Offgrid Teams").strip() or "Offgrid Teams"
 BRAND_TAGLINE = os.environ.get("LAN_CHAT_BRAND_TAGLINE", "Zero-data local Wi-Fi chat. Each device IP gets one account; enter your PIN if your IP changes.").strip()
 BRAND_ACCENT = os.environ.get("LAN_CHAT_ACCENT_COLOR", "").strip()
 
@@ -74,7 +74,7 @@ async def lifespan(_app: FastAPI):
             manager.disconnect(uname, ws)
 
 
-app = FastAPI(title="LAN Chat App", lifespan=lifespan)
+app = FastAPI(title="Offgrid Teams", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -574,8 +574,8 @@ async def index() -> HTMLResponse:
 async def pwa_manifest() -> JSONResponse:
     return JSONResponse(
         {
-            "name": "LAN Chat",
-            "short_name": "LAN Chat",
+            "name": "Offgrid Teams",
+            "short_name": "Offgrid Teams",
             "description": "Zero-data offline local Wi-Fi chat",
             "start_url": "/",
             "display": "standalone",
@@ -609,7 +609,7 @@ async def pwa_icon() -> Response:
 
 @app.get("/sw.js")
 async def pwa_service_worker() -> Response:
-    sw_js = '''const CACHE_NAME = "lan-chat-shell-v19";
+    sw_js = '''const CACHE_NAME = "lan-chat-shell-v20";
 const MEDIA_CACHE = "lan-chat-media-v1";
 const SHELL_URLS = ["/", "/manifest.json", "/icon.svg"];
 
@@ -1619,10 +1619,10 @@ async def run_local_ai(
             combined_context += "\n\n--- SHARED FILES ---\n" + "\n\n".join(doc_lines)
 
         if mode == "summarize":
-            sys_prompt = "You are a concise offline LAN Chat AI assistant. Summarize the chat conversation and key action items in clean Markdown bullets."
+            sys_prompt = "You are a concise offline Offgrid Teams AI assistant. Summarize the chat conversation and key action items in clean Markdown bullets."
             usr_prompt = f"Summarize this chat transcript:\n\n{combined_context[:12000]}"
         else:
-            sys_prompt = "You are a concise offline LAN Chat RAG assistant. Answer the user's question directly using only the provided chat transcript and shared file excerpts."
+            sys_prompt = "You are a concise offline Offgrid Teams RAG assistant. Answer the user's question directly using only the provided chat transcript and shared file excerpts."
             usr_prompt = f"Question: {payload.query}\n\nContext:\n{combined_context[:12000]}"
 
         llm_ans, engine = _query_local_llm(sys_prompt, usr_prompt)
@@ -2304,7 +2304,7 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>LAN Chat</title>
+  <title>Offgrid Teams</title>
   <link rel="manifest" href="/manifest.json" />
   <meta name="theme-color" content="#00a884" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -2885,7 +2885,7 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
 <body>
   <div id="login-screen">
     <form class="login-card" id="login-form">
-      <h1>LAN Chat</h1>
+      <h1>Offgrid Teams</h1>
       <p>Zero-data local Wi-Fi chat. Each device IP gets one account; enter your PIN if your IP changes.</p>
       <input id="username-input" type="text" placeholder="Username (letters, numbers, _ or -)" required maxlength="24" />
       <input id="pin-input" type="password" inputmode="numeric" placeholder="4-8 digit PIN" required minlength="4" maxlength="8" />
@@ -5077,7 +5077,7 @@ OFFLINE_HTML = r"""<!DOCTYPE html>
           playChime();
           appendLocalAiCard("🔔 Reminder Alert!", `**${note}** *(scheduled ${amount}${unit} ago)*`, "Timer Done", true);
           if ("Notification" in window && Notification.permission === "granted") {
-            new Notification("LAN Chat Reminder", { body: note, icon: "/icon.svg" });
+            new Notification("Offgrid Teams Reminder", { body: note, icon: "/icon.svg" });
           }
         }, delayMs);
         return true;
@@ -6457,7 +6457,7 @@ def start_mdns(lan_ip: str, port: int = 8000) -> tuple[Any, Any] | None:
         zc = Zeroconf(interfaces=[lan_ip])
         info = ServiceInfo(
             "_http._tcp.local.",
-            "LAN Chat._http._tcp.local.",
+            "Offgrid Teams._http._tcp.local.",
             addresses=[socket.inet_aton(lan_ip)],
             port=port,
             server="chat.local.",
@@ -6541,7 +6541,7 @@ if __name__ == "__main__":
     mdns_url = f"{scheme}://chat.local:{port}"
 
     all_ips = get_all_lan_ips()
-    print("LAN Chat running on:")
+    print("Offgrid Teams running on:")
     print(f"  Local:   {scheme}://127.0.0.1:{port}")
     if mdns_handle:
         print(f"  mDNS:    {mdns_url}")
